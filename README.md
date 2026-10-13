@@ -1,0 +1,1 @@
+The viewer for Worldcereal embeddings. 
