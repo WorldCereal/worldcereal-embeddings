@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>WorldCereal Embeddings Viewer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/proj4@2.9.0/dist/proj4.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
+<style>
+  :root { --bg:#12131c; --panel:#1a1c28; --line:#2a2d40; --txt:#d0d6e8; --dim:#7b84a0;
+          --acc:#c8922a; --s3:#2ecc71; --local:#f39c12; --todo:#e74c3c; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--txt);
+               font:13px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #app { display:flex; height:100%; }
+  #side { width:350px; min-width:350px; overflow-y:auto; background:var(--panel);
+          border-right:1px solid var(--line); padding:12px 14px; }
+  #map { flex:1; }
+  h1 { font-size:16px; margin:0 0 2px; }
+  .sub { color:var(--dim); font-size:11px; margin-bottom:10px; }
+  .sec { border-top:1px solid var(--line); padding:10px 0; }
+  .sec h2 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  .legend label { display:flex; align-items:center; gap:8px; margin:3px 0; cursor:pointer; }
+  .sw { width:22px; height:12px; border:2px solid; border-radius:2px; }
+  .cnt { margin-left:auto; color:var(--dim); font-variant-numeric:tabular-nums; }
+  input[type=text], input[type=number], select { background:#0f1018; color:var(--txt);
+          border:1px solid var(--line); border-radius:4px; padding:4px 6px; font:inherit; }
+  input[type=number] { width:56px; }
+  button, .btn { background:#262a3d; color:var(--txt); border:1px solid #363b55; border-radius:4px;
+          padding:5px 9px; font:inherit; cursor:pointer; text-decoration:none; display:inline-block; }
+  button:hover, .btn:hover { background:#30354d; }
+  button.active { background:var(--acc); color:#111; border-color:var(--acc); }
+  button:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin:5px 0; }
+  .kv { display:grid; grid-template-columns:90px 1fr; gap:2px 8px; font-size:12px; }
+  .kv div:nth-child(odd) { color:var(--dim); }
+  .mono { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:11px; word-break:break-all; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px; color:#111; font-weight:600; }
+  .note { color:var(--dim); font-size:11px; }
+  .warn { background:#3a2410; border:1px solid #8a5a1a; color:#f0c890; padding:8px; border-radius:4px;
+          font-size:11px; margin:8px 0; }
+  .warn code { color:#fff; }
+  #status { color:var(--acc); font-size:11px; min-height:16px; }
+  .spin { display:inline-block; width:10px; height:10px; border:2px solid var(--acc); border-right-color:transparent;
+          border-radius:50%; animation:sp 0.8s linear infinite; vertical-align:-1px; margin-right:5px; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  .float { position:absolute; z-index:1000; background:var(--panel); border:1px solid var(--line);
+           border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.5); display:none; flex-direction:column; }
+  .float .hd { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid var(--line);
+               cursor:move; font-weight:600; }
+  .float .hd .x { margin-left:auto; cursor:pointer; color:var(--dim); }
+  .float .bd { padding:8px 10px; overflow:auto; }
+  #px  { right:14px; top:14px; width:460px; max-height:80vh; }
+  #ep  { right:14px; bottom:14px; width:480px; height:440px; }
+  #sp  { left:370px; bottom:14px; width:480px; height:500px; }
+  .plot { flex:1; min-height:200px; }
+  .pt { display:flex; align-items:center; gap:6px; font-size:11px; margin:2px 0; }
+  .dot { width:10px; height:10px; border-radius:50%; flex:none; }
+  .leaflet-tooltip.tiletip { background:#1a1c28; color:var(--txt); border:1px solid var(--line); }
+  .leaflet-container { background:#0d0e14; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>WorldCereal Embeddings</h1>
+    <div class="sub">128-dim embeddings per S2 tile · uint8 quantized + per-pixel scale</div>
+
+    <div id="cors-warn" class="warn" style="display:none"></div>
+
+    <div class="sec legend">
+      <h2>S2 tiles</h2>
+      <label><input type="checkbox" data-st="on_s3" checked/><span class="sw" style="border-color:var(--s3)"></span>On S3 (viewable &amp; downloadable)<span class="cnt" id="c-on_s3"></span></label>
+      <label><input type="checkbox" data-st="local" checked/><span class="sw" style="border-color:var(--local)"></span>Processed, not on S3 yet<span class="cnt" id="c-local"></span></label>
+      <label><input type="checkbox" data-st="todo" checked/><span class="sw" style="border-color:var(--todo)"></span>To be processed<span class="cnt" id="c-todo"></span></label>
+      <div class="row" style="margin-top:8px">
+        <input type="text" id="q" placeholder="Go to tile, e.g. 31UFS" style="flex:1"/>
+        <button onclick="gotoTile()">Go</button>
+      </div>
+      <div class="note" id="grid-date"></div>
+    </div>
+
+    <div class="sec" id="tile-sec">
+      <h2>Selected tile</h2>
+      <div id="tile-info" class="note">Click a tile on the map.</div>
+    </div>
+
+    <div class="sec" id="view-sec" style="display:none">
+      <h2>Display</h2>
+      <div class="row">
+        <label><input type="radio" name="mode" value="emb" checked/> Embeddings (uint8)</label>
+      </div>
+      <div class="row">
+        <label><input type="radio" name="mode" value="deq"/> Dequantized <span class="note">(q−128)·scale</span></label>
+      </div>
+      <div class="row">
+        <label><input type="radio" name="mode" value="scale"/> Scale</label>
+      </div>
+      <div class="row" id="band-row">
+        R <input type="number" id="b-r" min="1" max="128" value="8"/>
+        G <input type="number" id="b-g" min="1" max="128" value="64"/>
+        B <input type="number" id="b-b" min="1" max="128" value="120"/>
+        <button onclick="applyBands()">Apply</button>
+        <button onclick="randomBands()" title="Random spread-out bands">🎲</button>
+      </div>
+      <div class="row">
+        Opacity <input type="range" id="opacity" min="0" max="1" step="0.05" value="1" style="flex:1"/>
+      </div>
+      <div class="row">
+        <button onclick="stretchFromView()" title="2–98 % stretch from the pixels in view">Stretch to view</button>
+        <button onclick="resetStretch()">Tile stretch</button>
+      </div>
+      <div id="legend-scale" class="note"></div>
+    </div>
+
+    <div class="sec" id="tools-sec" style="display:none">
+      <h2>Tools</h2>
+      <div class="note" style="margin-bottom:6px">Click inside the loaded tile to identify a pixel (all 128 dimensions, dequantized).</div>
+      <div class="row">
+        <button id="btn-explore" onclick="toggleExplore()">3D explore (draw box)</button>
+        <button id="btn-sampler" onclick="toggleSampler()">Class sampler</button>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div id="status"></div>
+      <div class="note">
+        Dequantization: <span class="mono">embedding = (float(q) − 128) · scale</span>,
+        with <span class="mono">q</span> the uint8 value of the embeddings file and
+        <span class="mono">scale</span> band 1 of the matching <span class="mono">_scale.tif</span>
+        (same grid). Nodata: 255 / NaN.
+      </div>
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<!-- Pixel identify -->
+<div id="px" class="float">
+  <div class="hd"><span>Pixel values</span><span class="x" onclick="clearPoints()" title="Clear points">clear</span><span class="x" onclick="hide('px')">✕</span></div>
+  <div class="bd">
+    <div id="px-list"></div>
+    <div id="px-plot" style="height:240px"></div>
+    <div class="note">Plot: dequantized values of the 128 dimensions. Up to 8 points are kept for comparison.</div>
+  </div>
+</div>
+
+<!-- 3D explore -->
+<div id="ep" class="float">
+  <div class="hd"><span>3D explore · PCA of dequantized embeddings</span><span class="x" onclick="closeExplore()">✕</span></div>
+  <div class="bd note" id="ep-status"></div>
+  <div id="ep-plot" class="plot"></div>
+</div>
+
+<!-- Class sampler -->
+<div id="sp" class="float">
+  <div class="hd"><span>Class sampler · shared PCA</span><span class="x" onclick="closeSampler()">✕</span></div>
+  <div class="bd">
+    <div class="row">
+      <input type="text" id="sp-name" placeholder="Class name" style="flex:1"/>
+      <input type="color" id="sp-color" value="#e05252"/>
+      <button id="sp-draw" onclick="startSamplerDraw()">✏ Draw box</button>
+      <button onclick="clearSamples()">Clear</button>
+    </div>
+    <div id="sp-list"></div>
+    <div class="note" id="sp-status">Draw boxes over different land cover types.</div>
+  </div>
+  <div id="sp-plot" class="plot"></div>
+</div>
+
+<script>
+'use strict';
+
+// ═══════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════
+const CFG = {
+  GRID_URL: 'data/s2_grid.geojson',
+  S3_BASE:  'https://s3.waw4-1.cloudferro.com/worldcereal-phase2-waw4-1-embeddings/worldcereal_embeddings',
+  COLORS: { on_s3:'#2ecc71', local:'#f39c12', todo:'#e74c3c' },
+  NODATA: 255,
+  THUMB_W: 512,          // overview width used for the tile-wide stretch
+  MAX_OUT: 1600,         // max rendered canvas side
+  REFRESH_DELAY: 300,
+  MAX_POINTS: 8,
+  PT_COLORS: ['#ff6b6b','#4dabf7','#69db7c','#ffd43b','#da77f2','#ff922b','#3bc9db','#a9e34b'],
+};
+
+// ═══════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════
+const S = {
+  map: null, grid: null, gridData: null, byTile: {}, hl: null,
+  proxy: false, cors: null,       // cors: true/false once probed
+  pool: null,
+};
+// the loaded tile
+const T = {
+  props: null, loaded: false, emb: null, scl: null,
+  projDef: null, origin: null, res: null, W: 0, H: 0,
+  overlay: null, mode: 'emb', bands: [8, 64, 120],
+  stretch: {},                  // key -> [{min,max} x3] or {min,max}
+  view: null,                   // last rendered: {mode, arrays, window, outW, outH}
+  token: 0,
+};
+const PTS = [];                 // identified points
+
+// ═══════════════════════════════════════════════════════════
+// UTIL
+// ═══════════════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const show = id => { $(id).style.display = 'flex'; };
+const hide = id => { $(id).style.display = 'none'; };
+function status(msg, busy) { $('status').innerHTML = (busy ? '<span class="spin"></span>' : '') + esc(msg || ''); }
+function fmtBytes(b) { if (!b) return ''; return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : (b/1e6).toFixed(1)+' MB'; }
+function url(file) { return `${CFG.S3_BASE}/${file}`; }
+function resolveUrl(u) { return u; }
+
+function projFor(epsg) {
+  const key = `EPSG:${epsg}`;
+  if (!proj4.defs(key)) {
+    if (epsg >= 32601 && epsg <= 32660) proj4.defs(key, `+proj=utm +zone=${epsg-32600} +datum=WGS84 +units=m +no_defs`);
+    else if (epsg >= 32701 && epsg <= 32760) proj4.defs(key, `+proj=utm +zone=${epsg-32700} +south +datum=WGS84 +units=m +no_defs`);
+    else throw new Error(`Unsupported EPSG:${epsg}`);
+  }
+  return key;
+}
+const toLL   = (p, x, y) => { const [lng, lat] = proj4(p, 'WGS84', [x, y]); return { lat, lng }; };
+const fromLL = (p, lat, lng) => { const [x, y] = proj4('WGS84', p, [lng, lat]); return { x, y }; };
+
+// percentile stretch on a sample of valid values
+function pstretch(arr, valid, lo = 2, hi = 98) {
+  const step = Math.max(1, Math.floor(arr.length / 100000));
+  const v = [];
+  for (let i = 0; i < arr.length; i += step) if (valid(i) && isFinite(arr[i])) v.push(arr[i]);
+  if (!v.length) return { min: 0, max: 1 };
+  v.sort((a, b) => a - b);
+  const mn = v[Math.floor(lo / 100 * (v.length - 1))], mx = v[Math.ceil(hi / 100 * (v.length - 1))];
+  return { min: mn, max: mx > mn ? mx : mn + 1e-6 };
+}
+const VIRIDIS = [[68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],[31,158,137],[53,183,121],[109,205,89],[180,222,44],[253,231,37]];
+function ramp(t) {
+  t = Math.max(0, Math.min(1, t)) * (VIRIDIS.length - 1);
+  const i = Math.min(Math.floor(t), VIRIDIS.length - 2), f = t - i, a = VIRIDIS[i], b = VIRIDIS[i + 1];
+  return [a[0] + (b[0]-a[0])*f, a[1] + (b[1]-a[1])*f, a[2] + (b[2]-a[2])*f];
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAP + GRID
+// ═══════════════════════════════════════════════════════════
+function initMap() {
+  S.map = L.map('map', { zoomControl: true, preferCanvas: false }).setView([47, 3], 5);
+  S.map.createPane('raster').style.zIndex = 350;   // below the grid outlines
+  S.map.createPane('draw').style.zIndex = 650;
+  const base = {
+    'Imagery': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: '© Esri', maxZoom: 19 }),
+    'OSM':     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap', maxZoom: 19 }),
+  };
+  base['Imagery'].addTo(S.map);
+  L.control.layers(base, {}, { position: 'topright' }).addTo(S.map);
+  L.control.scale({ imperial: false }).addTo(S.map);
+  S.map.on('moveend', scheduleRender);
+  S.map.on('click', e => onMapClick(e.latlng));
+}
+
+function gridStyle(f) {
+  const p = f.properties, sel = T.props && T.props.tile === p.tile;
+  return { color: sel ? '#ffffff' : CFG.COLORS[p.status], weight: sel ? 3 : 1.2,
+           opacity: 0.9, fill: true, fillOpacity: sel ? 0 : 0.04, fillColor: CFG.COLORS[p.status] };
+}
+
+async function loadGrid() {
+  status('Loading tile grid…', true);
+  const res = await fetch(CFG.GRID_URL, { cache: 'no-cache' });
+  if (!res.ok) throw new Error(`grid: HTTP ${res.status}`);
+  S.gridData = await res.json();
+  if (S.gridData.s3_base) CFG.S3_BASE = S.gridData.s3_base;
+  for (const f of S.gridData.features) S.byTile[f.properties.tile] = f;
+  const c = S.gridData.counts || {};
+  for (const k of ['on_s3', 'local', 'todo']) $('c-' + k).textContent = c[k] ?? '';
+  $('grid-date').textContent = S.gridData.generated ? `Status as of ${S.gridData.generated.replace('T', ' ').slice(0, 16)} UTC` : '';
+  drawGrid();
+  status('');
+}
+
+function drawGrid() {
+  if (S.grid) S.map.removeLayer(S.grid);
+  const on = new Set([...document.querySelectorAll('.legend input[data-st]')].filter(i => i.checked).map(i => i.dataset.st));
+  S.grid = L.geoJSON(S.gridData, {
+    filter: f => on.has(f.properties.status) || (T.props && T.props.tile === f.properties.tile),
+    style: gridStyle,
+    onEachFeature: (f, lyr) => {
+      const p = f.properties;
+      lyr.bindTooltip(`<b>${p.tile}</b> · ${esc((p.countries || []).join(', '))}<br>${p.start_date} → ${p.end_date}<br>${statusLabel(p.status)}`,
+                      { sticky: true, className: 'tiletip' });
+      lyr.on('click', e => {
+        L.DomEvent.stopPropagation(e);
+        if (EX.mode || SAMPLER.mode) return;
+        if (T.loaded && insideTile(e.latlng)) identify(e.latlng);
+        else selectTile(p.tile);
+      });
+    },
+  }).addTo(S.map);
+}
+
+function statusLabel(s) {
+  return { on_s3: 'On S3', local: 'Processed locally, not on S3 yet', todo: 'To be processed' }[s] || s;
+}
+
+function gotoTile() {
+  const t = $('q').value.trim().toUpperCase().replace(/^T(?=\d)/, '');
+  if (!S.byTile[t]) { status(`Tile ${t} is not in the grid`); return; }
+  selectTile(t, true);
+}
+
+// ═══════════════════════════════════════════════════════════
+// TILE SELECTION
+// ═══════════════════════════════════════════════════════════
+function selectTile(tile, zoom) {
+  const f = S.byTile[tile];
+  if (!f) return;
+  unloadTile();
+  T.props = f.properties;
+  location.hash = 'tile=' + tile;
+  drawGrid();
+  const b = L.geoJSON(f).getBounds();
+  if (zoom || !S.map.getBounds().contains(b)) S.map.fitBounds(b, { padding: [30, 30] });
+  renderTileInfo();
+  if (T.props.status === 'on_s3') loadTile();
+}
+
+function renderTileInfo() {
+  const p = T.props;
+  if (!p) { $('tile-info').innerHTML = '<span class="note">Click a tile on the map.</span>'; return; }
+  const onS3 = p.status === 'on_s3';
+  const eu = url(p.emb_file), su = url(p.scale_file);
+  $('tile-info').innerHTML = `
+    <div class="row" style="margin-top:0"><b style="font-size:15px">${p.tile}</b>
+      <span class="pill" style="background:${CFG.COLORS[p.status]}">${statusLabel(p.status)}</span></div>
+    <div class="kv">
+      <div>Period</div><div>${p.start_date} → ${p.end_date}</div>
+      <div>Countries</div><div>${esc((p.countries || []).join(', ') || '–')}</div>
+      <div>Cells</div><div>${p.n_cells} × 50 km · EPSG:${p.epsg}</div>
+      <div>Index</div><div class="note">${esc(p.detail)}</div>
+    </div>
+    ${onS3 ? `
+    <div class="row" style="margin-top:8px">
+      <a class="btn" href="${eu}" download title="${esc(p.emb_file)}">⬇ Embeddings ${fmtBytes(p.emb_bytes)}</a>
+      <a class="btn" href="${su}" download title="${esc(p.scale_file)}">⬇ Scale ${fmtBytes(p.scale_bytes)}</a>
+      <a class="btn" href="${su}.aux.xml" download title="scale statistics (GDAL .aux.xml)">⬇ .aux.xml</a>
+    </div>
+    <div class="row"><button onclick="copyLinks()">Copy https links</button>
+      <button onclick="loadTile()" ${T.loaded ? 'disabled' : ''}>${T.loaded ? 'Loaded' : 'Load in viewer'}</button>
+      <button onclick="closeTile()">Close</button></div>
+    <div class="mono note" style="margin-top:4px">${esc(p.emb_file)}<br>${esc(p.scale_file)}</div>`
+    : `<div class="note" style="margin-top:8px">${p.status === 'local'
+         ? 'Processed, waiting to be uploaded to S3. Downloads and viewing become available once it is on S3.'
+         : 'Not processed yet.'}</div>
+       <div class="row"><button onclick="closeTile()">Close</button></div>`}`;
+}
+
+function copyLinks() {
+  const p = T.props;
+  navigator.clipboard.writeText([url(p.emb_file), url(p.scale_file)].join('\n'))
+    .then(() => status('Links copied'), () => status('Copy failed'));
+}
+
+function closeTile() { unloadTile(); T.props = null; history.replaceState(null, '', location.pathname); drawGrid(); renderTileInfo(); }
+
+function unloadTile() {
+  T.token++;
+  if (T.overlay) S.map.removeLayer(T.overlay);
+  Object.assign(T, { loaded: false, emb: null, scl: null, overlay: null, stretch: {}, view: null });
+  $('view-sec').style.display = 'none';
+  $('tools-sec').style.display = 'none';
+  $('legend-scale').textContent = '';
+}
+
+// ═══════════════════════════════════════════════════════════
+// COG LOADING
+// ═══════════════════════════════════════════════════════════
+async function openCOG(u) {
+  const tiff = await GeoTIFF.fromUrl(resolveUrl(u), { allowFullFile: false });
+  const n = await tiff.getImageCount();
+  const images = [];
+  for (let i = 0; i < n; i++) images.push(await tiff.getImage(i));
+  images.sort((a, b) => b.getWidth() - a.getWidth());
+  return { tiff, images };
+}
+
+async function loadTile() {
+  if (!T.props || T.loaded) return;
+  const tok = ++T.token, p = T.props;
+  status(`Opening ${p.tile}…`, true);
+  try {
+    if (S.cors === null) await probeCors(url(p.scale_file));
+    const [emb, scl] = await Promise.all([openCOG(url(p.emb_file)), openCOG(url(p.scale_file))]);
+    if (tok !== T.token) return;
+    const full = emb.images[0];
+    if (scl.images[0].getWidth() !== full.getWidth() || scl.images[0].getHeight() !== full.getHeight())
+      throw new Error('embeddings and scale grids differ');
+    Object.assign(T, {
+      emb, scl, projDef: projFor(p.epsg), origin: full.getOrigin(), res: full.getResolution(),
+      W: full.getWidth(), H: full.getHeight(), loaded: true,
+    });
+    $('view-sec').style.display = '';
+    $('tools-sec').style.display = '';
+    renderTileInfo();
+    await render(true);
+  } catch (err) {
+    if (tok !== T.token) return;
+    console.error(err);
+    status(`Could not open ${p.tile}: ${err.message}`);
+    if (S.cors === false) showCorsWarning();
+  }
+}
+
+// the scale overview with the same width as the chosen embeddings overview
+function pair(img) { return T.scl.images.find(i => i.getWidth() === img.getWidth()) || T.scl.images[0]; }
+function pickOverview(target) {
+  const imgs = T.emb.images, ok = imgs.filter(i => i.getWidth() >= target);
+  return ok.length ? ok[ok.length - 1] : imgs[0];
+}
+
+// Read arrays needed for the current mode over a full-res pixel window, resampled to outW x outH
+async function readMode(mode, win, outW, outH) {
+  const [c0, r0, c1, r1] = win;
+  const img = pickOverview(Math.min(T.W, Math.round(outW * T.W / (c1 - c0))));
+  const f = T.W / img.getWidth();
+  const w = [Math.floor(c0 / f), Math.floor(r0 / f),
+             Math.min(img.getWidth(), Math.ceil(c1 / f)), Math.min(img.getHeight(), Math.ceil(r1 / f))];
+  const opts = { window: w, width: outW, height: outH, interleave: false, pool: S.pool };
+  const need = { emb: [true, false], deq: [true, true], scale: [false, true] }[mode];
+  const [q, s] = await Promise.all([
+    need[0] ? img.readRasters({ ...opts, samples: T.bands.map(b => b - 1), fillValue: CFG.NODATA }) : null,
+    need[1] ? pair(img).readRasters({ ...opts, samples: [0], fillValue: NaN }) : null,
+  ]);
+  let arrays;
+  if (mode === 'emb') arrays = [q[0], q[1], q[2]];
+  else if (mode === 'scale') arrays = [s[0]];
+  else {
+    const n = outW * outH;
+    arrays = [0, 1, 2].map(k => {
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = q[k][i] === CFG.NODATA || isNaN(s[0][i]) ? NaN : (q[k][i] - 128) * s[0][i];
+      return out;
+    });
+  }
+  return { arrays, factor: f };
+}
+
+function validFn(mode, arrays) {
+  return mode === 'emb' ? i => arrays[0][i] !== CFG.NODATA : i => isFinite(arrays[0][i]);
+}
+function computeStretch(mode, arrays) {
+  const v = validFn(mode, arrays);
+  return mode === 'scale' ? [pstretch(arrays[0], v)] : arrays.map(a => pstretch(a, v));
+}
+function stretchKey() { return T.mode === 'scale' ? 'scale' : `${T.mode}:${T.bands.join(',')}`; }
+
+// tile-wide stretch from a coarse overview
+async function ensureStretch() {
+  const key = stretchKey();
+  if (T.stretch[key]) return T.stretch[key];
+  const w = Math.min(CFG.THUMB_W, T.W), h = Math.max(1, Math.round(T.H * w / T.W));
+  const { arrays } = await readMode(T.mode, [0, 0, T.W, T.H], w, h);
+  return (T.stretch[key] = computeStretch(T.mode, arrays));
+}
+
+// ═══════════════════════════════════════════════════════════
+// RENDERING (on-the-fly UTM -> Web Mercator warp of the viewport)
+// ═══════════════════════════════════════════════════════════
+let renderTimer = null;
+function scheduleRender() { clearTimeout(renderTimer); renderTimer = setTimeout(() => render(false), CFG.REFRESH_DELAY); }
+
+function viewportWindow() {
+  const mb = S.map.getBounds(), [ox, oy] = T.origin, [rx, ry] = T.res;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  const lats = [mb.getSouth(), (mb.getSouth() + mb.getNorth()) / 2, mb.getNorth()];
+  const lngs = [mb.getWest(), (mb.getWest() + mb.getEast()) / 2, mb.getEast()];
+  for (const la of lats) for (const ln of lngs) {
+    try { const { x, y } = fromLL(T.projDef, la, ln); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); } catch (e) {}
+  }
+  const c0 = Math.max(0, Math.floor((x0 - ox) / rx)), c1 = Math.min(T.W, Math.ceil((x1 - ox) / rx));
+  const r0 = Math.max(0, Math.floor((y1 - oy) / ry)), r1 = Math.min(T.H, Math.ceil((y0 - oy) / ry));
+  return c0 < c1 && r0 < r1 ? [c0, r0, c1, r1] : null;
+}
+
+async function render(fit) {
+  if (!T.loaded) return;
+  const tok = T.token;
+  if (fit) {
+    const f = S.byTile[T.props.tile];
+    S.map.fitBounds(L.geoJSON(f).getBounds(), { padding: [30, 30], animate: false });
+  }
+  const win = viewportWindow();
+  if (!win) return;
+  const size = S.map.getSize(), dpr = window.devicePixelRatio || 1;
+  // output resolution: never finer than the native pixels in view
+  const outW = Math.max(16, Math.min(CFG.MAX_OUT, Math.round(size.x * dpr), win[2] - win[0]));
+  const outH = Math.max(16, Math.min(CFG.MAX_OUT, Math.round(size.y * dpr), win[3] - win[1]));
+  const mode = T.mode;
+  status(`Reading ${T.props.tile} (${mode})…`, true);
+  try {
+    const st = await ensureStretch();
+    const { arrays } = await readMode(mode, win, outW, outH);
+    if (tok !== T.token || mode !== T.mode) return;
+    const bounds = S.map.getBounds();
+    const dataURL = warp(arrays, mode, st, win, outW, outH, bounds);
+    if (!T.overlay) T.overlay = L.imageOverlay(dataURL, bounds, { pane: 'raster', opacity: +$('opacity').value }).addTo(S.map);
+    else { T.overlay.setUrl(dataURL); T.overlay.setBounds(bounds); }
+    T.view = { mode, arrays, win, outW, outH };
+    updateScaleLegend(st);
+    status(`${T.props.tile} · ${win[2] - win[0]}×${win[3] - win[1]} px in view · ${mode === 'scale' ? 'scale' : 'bands ' + T.bands.join('/')}`);
+  } catch (err) {
+    if (tok !== T.token) return;
+    console.error(err);
+    status(`Read error: ${err.message}`);
+  }
+}
+
+function warp(arrays, mode, st, win, rW, rH, bounds) {
+  const [c0, r0, c1, r1] = win, [ox, oy] = T.origin, [rx, ry] = T.res;
+  const nMinX = ox + c0 * rx, nMaxX = ox + c1 * rx, nMaxY = oy + r0 * ry, nMinY = oy + r1 * ry;
+  const size = S.map.getSize(), dpr = window.devicePixelRatio || 1;
+  const outW = Math.min(CFG.MAX_OUT, Math.round(size.x * dpr)), outH = Math.min(CFG.MAX_OUT, Math.round(size.y * dpr));
+  const M = 24, MW = M + 1;
+  const west = bounds.getWest(), north = bounds.getNorth(), dLng = bounds.getEast() - west, dLat = north - bounds.getSouth();
+  // mesh in Web Mercator y so rows are spaced like the screen
+  const mY = lat => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
+  const yN = mY(north), yS = mY(bounds.getSouth());
+  const mc = new Float32Array(MW * MW), mr = new Float32Array(MW * MW);
+  for (let j = 0; j < MW; j++) {
+    const yy = yN + (yS - yN) * j / M, lat = (2 * Math.atan(Math.exp(yy)) - Math.PI / 2) * 180 / Math.PI;
+    for (let i = 0; i < MW; i++) {
+      const lng = west + dLng * i / M;
+      try { const [x, y] = proj4('WGS84', T.projDef, [lng, lat]);
+            mc[j * MW + i] = (x - nMinX) / (nMaxX - nMinX) * rW; mr[j * MW + i] = (nMaxY - y) / (nMaxY - nMinY) * rH; }
+      catch (e) { mc[j * MW + i] = -1; mr[j * MW + i] = -1; }
+    }
+  }
+  const cv = document.createElement('canvas'); cv.width = outW; cv.height = outH;
+  const ctx = cv.getContext('2d'), im = ctx.createImageData(outW, outH), d = im.data;
+  const a0 = arrays[0], a1 = arrays[1], a2 = arrays[2];
+  const s0 = st[0], s1 = st[1], s2 = st[2];
+  for (let py = 0; py < outH; py++) {
+    const mj = py / outH * M, j0 = Math.min(Math.floor(mj), M - 1), ty = mj - j0;
+    for (let px = 0; px < outW; px++) {
+      const mi = px / outW * M, i0 = Math.min(Math.floor(mi), M - 1), tx = mi - i0;
+      const k00 = j0 * MW + i0, k01 = k00 + 1, k10 = k00 + MW, k11 = k10 + 1;
+      const col = (mc[k00] * (1 - tx) + mc[k01] * tx) * (1 - ty) + (mc[k10] * (1 - tx) + mc[k11] * tx) * ty;
+      const row = (mr[k00] * (1 - tx) + mr[k01] * tx) * (1 - ty) + (mr[k10] * (1 - tx) + mr[k11] * tx) * ty;
+      const c = Math.floor(col), r = Math.floor(row);
+      if (c < 0 || r < 0 || c >= rW || r >= rH) continue;
+      const k = r * rW + c, o = (py * outW + px) * 4;
+      if (mode === 'scale') {
+        const v = a0[k]; if (!isFinite(v)) continue;
+        const rgb = ramp((v - s0.min) / (s0.max - s0.min));
+        d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = 255;
+      } else {
+        const v0 = a0[k];
+        if (mode === 'emb' ? v0 === CFG.NODATA : !isFinite(v0)) continue;
+        d[o]     = 255 * (v0 - s0.min) / (s0.max - s0.min);
+        d[o + 1] = 255 * (a1[k] - s1.min) / (s1.max - s1.min);
+        d[o + 2] = 255 * (a2[k] - s2.min) / (s2.max - s2.min);
+        d[o + 3] = 255;
+      }
+    }
+  }
+  ctx.putImageData(im, 0, 0);
+  return cv.toDataURL('image/png');
+}
+
+function updateScaleLegend(st) {
+  if (T.mode !== 'scale') {
+    $('legend-scale').textContent = `Stretch: ` + st.map((s, i) => `${'RGB'[i]} ${s.min.toFixed(T.mode === 'emb' ? 0 : 3)}…${s.max.toFixed(T.mode === 'emb' ? 0 : 3)}`).join(' · ');
+    return;
+  }
+  const g = VIRIDIS.map(c => `rgb(${c})`).join(',');
+  $('legend-scale').innerHTML = `<div style="height:10px;border-radius:2px;background:linear-gradient(90deg,${g})"></div>
+    <div class="row" style="justify-content:space-between;margin:2px 0"><span>${st[0].min.toPrecision(3)}</span><span>scale</span><span>${st[0].max.toPrecision(3)}</span></div>`;
+}
+
+function setMode(m) { T.mode = m; $('band-row').style.display = m === 'scale' ? 'none' : ''; render(false); }
+function applyBands() {
+  const b = ['b-r', 'b-g', 'b-b'].map(id => parseInt($(id).value));
+  if (b.some(v => !(v >= 1 && v <= 128))) { status('Bands must be 1–128'); return; }
+  T.bands = b; render(false);
+}
+function randomBands() {
+  const a = Math.floor(Math.random() * 43);
+  const b = [a + 1, a + 43, a + 86].map(v => Math.min(128, v));
+  ['b-r', 'b-g', 'b-b'].forEach((id, i) => $(id).value = b[i]);
+  applyBands();
+}
+function stretchFromView() {
+  if (!T.view || T.view.mode !== T.mode) return;
+  T.stretch[stretchKey()] = computeStretch(T.mode, T.view.arrays);
+  render(false);
+}
+function resetStretch() { delete T.stretch[stretchKey()]; render(false); }
+
+// ═══════════════════════════════════════════════════════════
+// PIXEL IDENTIFY
+// ═══════════════════════════════════════════════════════════
+function pixelOf(latlng) {
+  const { x, y } = fromLL(T.projDef, latlng.lat, latlng.lng);
+  return { col: Math.floor((x - T.origin[0]) / T.res[0]), row: Math.floor((y - T.origin[1]) / T.res[1]) };
+}
+function insideTile(latlng) {
+  if (!T.loaded) return false;
+  const { col, row } = pixelOf(latlng);
+  return col >= 0 && row >= 0 && col < T.W && row < T.H;
+}
+function onMapClick(latlng) {
+  if (EX.mode || SAMPLER.mode) return;
+  if (insideTile(latlng)) identify(latlng);
+}
+
+async function identify(latlng) {
+  const { col, row } = pixelOf(latlng);
+  show('px');
+  status('Reading pixel (128 bands + scale, full resolution)…', true);
+  try {
+    const win = [col, row, col + 1, row + 1];
+    const [q, s] = await Promise.all([
+      T.emb.images[0].readRasters({ window: win, interleave: true, pool: S.pool }),
+      T.scl.images[0].readRasters({ window: win, samples: [0], interleave: true }),
+    ]);
+    const qv = Array.from(q), sc = s[0];
+    const nodata = qv[0] === CFG.NODATA || !isFinite(sc);
+    const deq = nodata ? null : qv.map(v => (v - 128) * sc);
+    if (PTS.length >= CFG.MAX_POINTS) { const old = PTS.shift(); S.map.removeLayer(old.marker); }
+    const color = CFG.PT_COLORS[(PTS.length ? PTS[PTS.length - 1].ci + 1 : 0) % CFG.PT_COLORS.length];
+    const pt = { tile: T.props.tile, lat: latlng.lat, lng: latlng.lng, col, row, q: qv, scale: sc, deq, nodata, color,
+                 ci: CFG.PT_COLORS.indexOf(color) };
+    pt.marker = L.circleMarker(latlng, { pane: 'draw', radius: 6, color: '#fff', weight: 2, fillColor: color, fillOpacity: 1 }).addTo(S.map);
+    PTS.push(pt);
+    renderPoints();
+    status(nodata ? 'Nodata at this pixel' : '');
+  } catch (err) {
+    console.error(err);
+    status(`Pixel read error: ${err.message}`);
+  }
+}
+
+function renderPoints() {
+  $('px-list').innerHTML = PTS.map((p, i) => {
+    const norm = p.deq ? Math.sqrt(p.deq.reduce((a, v) => a + v * v, 0)) : null;
+    return `<div class="pt"><span class="dot" style="background:${p.color}"></span>
+      <b>${p.tile}</b> ${p.lat.toFixed(5)}, ${p.lng.toFixed(5)} · px ${p.col},${p.row}
+      ${p.nodata ? '<span class="note">nodata</span>' : `· scale ${p.scale.toPrecision(4)} · ‖e‖ ${norm.toFixed(2)}`}
+      <span style="margin-left:auto"></span>
+      ${p.nodata ? '' : `<a href="#" onclick="copyVec(${i},'deq');return false" title="copy dequantized vector">deq</a>
+      <a href="#" onclick="copyVec(${i},'q');return false" title="copy uint8 vector">q</a>`}</div>`;
+  }).join('');
+  const traces = PTS.filter(p => p.deq).map(p => ({
+    type: 'scatter', mode: 'lines', name: `${p.lat.toFixed(4)}, ${p.lng.toFixed(4)}`,
+    x: p.deq.map((_, i) => i), y: p.deq, line: { color: p.color, width: 1.5 },
+    hovertemplate: 'dim %{x}: %{y:.4f}<extra></extra>',
+  }));
+  Plotly.react('px-plot', traces, {
+    paper_bgcolor: '#1a1c28', plot_bgcolor: '#12131c', margin: { l: 40, r: 10, t: 10, b: 30 },
+    font: { color: '#8892aa', size: 10 }, showlegend: false,
+    xaxis: { title: 'dimension', gridcolor: '#252840', range: [0, 127] },
+    yaxis: { title: 'value', gridcolor: '#252840', zerolinecolor: '#444a66' },
+  }, { displayModeBar: false, responsive: true });
+}
+
+function copyVec(i, kind) {
+  const p = PTS[i], v = kind === 'q' ? p.q : p.deq.map(x => +x.toFixed(6));
+  navigator.clipboard.writeText(v.join(',')).then(() => status(`Copied ${kind === 'q' ? 'uint8' : 'dequantized'} vector (${v.length} values)`));
+}
+function clearPoints() { for (const p of PTS) S.map.removeLayer(p.marker); PTS.length = 0; renderPoints(); }
+
+// ═══════════════════════════════════════════════════════════
+// READ ALL 128 DIMENSIONS (dequantized) FOR A BOX
+// ═══════════════════════════════════════════════════════════
+async function readBoxVectors(bounds, maxDim, maxPts) {
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const [la, ln] of [[bounds.getSouth(), bounds.getWest()], [bounds.getSouth(), bounds.getEast()],
+                          [bounds.getNorth(), bounds.getWest()], [bounds.getNorth(), bounds.getEast()]]) {
+    const { x, y } = fromLL(T.projDef, la, ln);
+    x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+  }
+  const [ox, oy] = T.origin, [rx, ry] = T.res;
+  const c0 = Math.max(0, Math.floor((x0 - ox) / rx)), c1 = Math.min(T.W, Math.ceil((x1 - ox) / rx));
+  const r0 = Math.max(0, Math.floor((y1 - oy) / ry)), r1 = Math.min(T.H, Math.ceil((y0 - oy) / ry));
+  if (c0 >= c1 || r0 >= r1) throw new Error('box is outside the loaded tile');
+  const img = pickOverview(Math.min(T.W, Math.round(maxDim * T.W / (c1 - c0))));
+  const f = T.W / img.getWidth();
+  const w = [Math.floor(c0 / f), Math.floor(r0 / f), Math.min(img.getWidth(), Math.ceil(c1 / f)), Math.min(img.getHeight(), Math.ceil(r1 / f))];
+  const oW = Math.max(1, w[2] - w[0]), oH = Math.max(1, w[3] - w[1]);
+  const [q, s] = await Promise.all([
+    img.readRasters({ window: w, interleave: false, fillValue: CFG.NODATA, pool: S.pool }),
+    pair(img).readRasters({ window: w, samples: [0], interleave: false, fillValue: NaN }),
+  ]);
+  const n = oW * oH, step = Math.max(1, Math.floor(n / maxPts)), nb = q.length, out = [];
+  for (let i = 0; i < n; i += step) {
+    const sc = s[0][i];
+    if (q[0][i] === CFG.NODATA || !isFinite(sc)) continue;
+    const v = new Float32Array(nb);
+    for (let b = 0; b < nb; b++) v[b] = (q[b][i] - 128) * sc;
+    out.push(v);
+  }
+  return { vectors: out, w: oW, h: oH, factor: f };
+}
+
+// ═══════════════════════════════════════════════════════════
+// BOX DRAWING (shared by explore + sampler)
+// ═══════════════════════════════════════════════════════════
+function drawBox(color, onDone) {
+  let start = null, rect = null;
+  S.map.dragging.disable();
+  S.map.getContainer().style.cursor = 'crosshair';
+  const move = e => rect && rect.setBounds(L.latLngBounds(start, e.latlng));
+  const down = e => {
+    start = e.latlng;
+    rect = L.rectangle([start, start], { pane: 'draw', color, weight: 2, dashArray: '5,4', fillOpacity: 0.2, interactive: false }).addTo(S.map);
+    S.map.on('mousemove', move);
+    S.map.once('mouseup', up);
+  };
+  const up = e => {
+    finish();
+    const b = L.latLngBounds(start, e.latlng);
+    if (Math.abs(b.getNorth() - b.getSouth()) < 1e-4 || Math.abs(b.getEast() - b.getWest()) < 1e-4) { S.map.removeLayer(rect); onDone(null, null); return; }
+    onDone(b, rect);
+  };
+  const finish = () => {
+    S.map.off('mousedown', down); S.map.off('mousemove', move);
+    S.map.dragging.enable(); S.map.getContainer().style.cursor = '';
+  };
+  S.map.on('mousedown', down);
+  return () => { finish(); S.map.off('mouseup', up); if (rect) S.map.removeLayer(rect); };
+}
+
+// ═══════════════════════════════════════════════════════════
+// PCA
+// ═══════════════════════════════════════════════════════════
+function pca3(X0) {
+  const N = X0.length, D = X0[0].length, mean = new Float64Array(D);
+  for (const x of X0) for (let b = 0; b < D; b++) mean[b] += x[b];
+  for (let b = 0; b < D; b++) mean[b] /= N;
+  const X = X0.map(x => { const c = new Float64Array(D); for (let b = 0; b < D; b++) c[b] = x[b] - mean[b]; return c; });
+  let total = 0; for (const x of X) for (let b = 0; b < D; b++) total += x[b] * x[b]; total /= N;
+  const pcs = [], ev = [];
+  for (let k = 0; k < 3; k++) {
+    let v = new Float64Array(D); for (let b = 0; b < D; b++) v[b] = Math.sin(b * 7.13 + k * 3.7); norm(v);
+    for (let it = 0; it < 80; it++) {
+      const nv = new Float64Array(D);
+      for (const x of X) { let d = 0; for (let b = 0; b < D; b++) d += x[b] * v[b]; for (let b = 0; b < D; b++) nv[b] += x[b] * d; }
+      norm(nv);
+      let dot = 0; for (let b = 0; b < D; b++) dot += nv[b] * v[b];
+      v = nv; if (Math.abs(dot) > 1 - 1e-10) break;
+    }
+    let e = 0;
+    for (const x of X) { let d = 0; for (let b = 0; b < D; b++) d += x[b] * v[b]; e += d * d; for (let b = 0; b < D; b++) x[b] -= d * v[b]; }
+    pcs.push(v); ev.push(e / N);
+  }
+  const project = x => pcs.map(v => { let s = 0; for (let b = 0; b < D; b++) s += (x[b] - mean[b]) * v[b]; return s; });
+  return { project, varFrac: ev.map(e => e / (total || 1)) };
+}
+function norm(v) { let n = 0; for (const x of v) n += x * x; n = Math.sqrt(n) || 1; for (let i = 0; i < v.length; i++) v[i] /= n; }
+
+const SCENE = ax => ({ title: ax, color: '#8892aa', gridcolor: '#1e2038', zerolinecolor: '#252840' });
+const LAYOUT3D = () => ({ paper_bgcolor: '#10111a', margin: { l: 0, r: 0, t: 0, b: 0 }, font: { color: '#8892aa', size: 10 },
+  scene: { bgcolor: '#10111a', xaxis: SCENE('PC1'), yaxis: SCENE('PC2'), zaxis: SCENE('PC3') } });
+
+// ═══════════════════════════════════════════════════════════
+// 3D EXPLORE
+// ═══════════════════════════════════════════════════════════
+const EX = { mode: false, cancel: null, rect: null };
+function toggleExplore() {
+  if (EX.mode) { EX.cancel(); exploreOff(); return; }
+  if (!T.loaded) { status('Load a tile first'); return; }
+  if (SAMPLER.mode) { SAMPLER.cancel(); samplerDrawOff(); }
+  EX.mode = true; $('btn-explore').classList.add('active');
+  if (EX.rect) { S.map.removeLayer(EX.rect); EX.rect = null; }
+  EX.cancel = drawBox('#3a7bd5', async (b, rect) => {
+    exploreOff();
+    if (!b) return;
+    EX.rect = rect;
+    show('ep');
+    $('ep-status').textContent = 'Reading 128 bands + scale…';
+    try {
+      const { vectors, w, h } = await readBoxVectors(b, 64, 4096);
+      if (vectors.length < 10) { $('ep-status').textContent = `Only ${vectors.length} valid pixels, draw a larger box.`; return; }
+      $('ep-status').textContent = `PCA on ${vectors.length} pixels…`;
+      await sleep(10);
+      const p = pca3(vectors), P = vectors.map(p.project);
+      const rng = k => { let mn = Infinity, mx = -Infinity; for (const r of P) { mn = Math.min(mn, r[k]); mx = Math.max(mx, r[k]); } return [mn, mx - mn || 1]; };
+      const R = [0, 1, 2].map(rng);
+      const colors = P.map(r => `rgb(${r.map((v, k) => Math.round((v - R[k][0]) / R[k][1] * 255)).join(',')})`);
+      $('ep-status').textContent = `${vectors.length} pixels (${w}×${h} sampled) · variance explained ${p.varFrac.map(v => (v * 100).toFixed(1) + '%').join(' / ')}`;
+      await Plotly.newPlot('ep-plot', [{ type: 'scatter3d', mode: 'markers', x: P.map(r => r[0]), y: P.map(r => r[1]), z: P.map(r => r[2]),
+        marker: { size: 2.5, color: colors, opacity: 0.85 }, hovertemplate: 'PC1 %{x:.2f}<br>PC2 %{y:.2f}<br>PC3 %{z:.2f}<extra></extra>' }],
+        LAYOUT3D(), { displayModeBar: false, responsive: true });
+    } catch (err) { $('ep-status').textContent = `Error: ${err.message}`; }
+  });
+}
+function exploreOff() { EX.mode = false; $('btn-explore').classList.remove('active'); }
+function closeExplore() { hide('ep'); if (EX.mode) { EX.cancel(); exploreOff(); } if (EX.rect) { S.map.removeLayer(EX.rect); EX.rect = null; } }
+
+// ═══════════════════════════════════════════════════════════
+// CLASS SAMPLER
+// ═══════════════════════════════════════════════════════════
+const SP_PALETTE = ['#e05252', '#52b0e0', '#52e07f', '#e0c852', '#c052e0', '#e09052', '#52e0d4', '#a0e052', '#e052a8', '#8c8ce0'];
+const SAMPLER = { mode: false, cancel: null, samples: [] };
+function toggleSampler() {
+  if ($('sp').style.display === 'flex') { closeSampler(); return; }
+  show('sp'); $('btn-sampler').classList.add('active'); renderSamples();
+}
+function closeSampler() { if (SAMPLER.mode) { SAMPLER.cancel(); samplerDrawOff(); } hide('sp'); $('btn-sampler').classList.remove('active'); }
+function samplerDrawOff() { SAMPLER.mode = false; $('sp-draw').classList.remove('active'); $('sp-draw').textContent = '✏ Draw box'; }
+function startSamplerDraw() {
+  if (SAMPLER.mode) { SAMPLER.cancel(); samplerDrawOff(); return; }
+  if (!T.loaded) { $('sp-status').textContent = 'Load a tile first.'; return; }
+  if (EX.mode) { EX.cancel(); exploreOff(); }
+  if (SAMPLER.samples.length >= 10) { $('sp-status').textContent = 'Maximum 10 classes.'; return; }
+  const color = $('sp-color').value;
+  SAMPLER.mode = true; $('sp-draw').classList.add('active'); $('sp-draw').textContent = '… drag on map';
+  SAMPLER.cancel = drawBox(color, async (b, rect) => {
+    samplerDrawOff();
+    if (!b) return;
+    const name = $('sp-name').value.trim() || `Class ${SAMPLER.samples.length + 1}`;
+    $('sp-status').textContent = `Reading "${name}"…`;
+    try {
+      const { vectors } = await readBoxVectors(b, 48, 2048);
+      if (vectors.length < 5) { S.map.removeLayer(rect); $('sp-status').textContent = 'Too few valid pixels, draw a larger box.'; return; }
+      rect.setStyle({ dashArray: null, fillOpacity: 0.25 });
+      SAMPLER.samples.push({ name, color, vectors, rect, tile: T.props.tile });
+      $('sp-name').value = '';
+      $('sp-color').value = SP_PALETTE[SAMPLER.samples.length % SP_PALETTE.length];
+      renderSamples(); plotSamples();
+    } catch (err) { S.map.removeLayer(rect); $('sp-status').textContent = `Error: ${err.message}`; }
+  });
+}
+function renderSamples() {
+  $('sp-list').innerHTML = SAMPLER.samples.map((s, i) => `<div class="pt"><span class="dot" style="background:${s.color}"></span>
+    ${esc(s.name)} <span class="note">${s.vectors.length} px · ${s.tile}</span><span style="margin-left:auto"></span>
+    <a href="#" onclick="removeSample(${i});return false">✕</a></div>`).join('');
+}
+function removeSample(i) { S.map.removeLayer(SAMPLER.samples[i].rect); SAMPLER.samples.splice(i, 1); renderSamples(); plotSamples(); }
+function clearSamples() { for (const s of SAMPLER.samples) S.map.removeLayer(s.rect); SAMPLER.samples = []; renderSamples(); plotSamples(); }
+function plotSamples() {
+  if (!SAMPLER.samples.length) { Plotly.purge('sp-plot'); $('sp-status').textContent = 'Draw boxes over different land cover types.'; return; }
+  const all = SAMPLER.samples.flatMap(s => s.vectors), p = pca3(all);
+  const traces = SAMPLER.samples.map(s => {
+    const P = s.vectors.map(p.project);
+    return { type: 'scatter3d', mode: 'markers', name: s.name, x: P.map(r => r[0]), y: P.map(r => r[1]), z: P.map(r => r[2]),
+             marker: { size: 2.5, color: s.color, opacity: 0.82 } };
+  });
+  $('sp-status').textContent = `${SAMPLER.samples.length} class(es) · ${all.length} pixels · variance ${p.varFrac.map(v => (v * 100).toFixed(1) + '%').join(' / ')}`;
+  Plotly.newPlot('sp-plot', traces, { ...LAYOUT3D(), showlegend: true,
+    legend: { x: 0, y: 1, bgcolor: 'rgba(16,17,26,.75)', font: { size: 10, color: '#c8d0e8' } } }, { displayModeBar: false, responsive: true });
+}
+
+// ═══════════════════════════════════════════════════════════
+// CORS
+// ═══════════════════════════════════════════════════════════
+// can the browser read the bucket directly (ranged GET needs a CORS rule on the bucket)?
+async function probeCors(u) {
+  try { S.cors = (await fetch(u, { headers: { Range: 'bytes=0-15' } })).ok; }
+  catch (e) { S.cors = false; }
+  if (!S.cors) showCorsWarning();
+}
+function showCorsWarning() {
+  const w = $('cors-warn');
+  w.style.display = '';
+  w.innerHTML = `<b>The browser can't read the bucket.</b> <code>worldcereal-phase2-waw4-1-embeddings</code>
+    needs a CORS rule (as on the UK bucket): allowed origin <code>*</code>, methods GET/HEAD, allowed header
+    <code>Range</code>, exposed headers <code>Content-Range, Content-Length, Accept-Ranges, ETag</code>.
+    Downloads work regardless.`;
+}
+
+// ═══════════════════════════════════════════════════════════
+// DRAGGABLE PANELS
+// ═══════════════════════════════════════════════════════════
+function draggable(id) {
+  const el = $(id), hd = el.querySelector('.hd');
+  hd.addEventListener('mousedown', e => {
+    if (e.target.classList.contains('x')) return;
+    const r = el.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+    const mv = ev => { el.style.left = (ev.clientX - dx) + 'px'; el.style.top = (ev.clientY - dy) + 'px'; el.style.right = 'auto'; el.style.bottom = 'auto'; };
+    const up = () => { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); };
+    document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════
+async function init() {
+  initMap();
+  S.pool = null;   // decode on the main thread, as in the UK viewer (float.html)
+  ['px', 'ep', 'sp'].forEach(draggable);
+  document.querySelectorAll('.legend input[data-st]').forEach(i => i.addEventListener('change', drawGrid));
+  document.querySelectorAll('input[name=mode]').forEach(i => i.addEventListener('change', () => setMode(i.value)));
+  $('opacity').addEventListener('input', e => T.overlay && T.overlay.setOpacity(+e.target.value));
+  $('q').addEventListener('keydown', e => { if (e.key === 'Enter') gotoTile(); });
+  try { await loadGrid(); } catch (err) { status(`Could not load the grid: ${err.message}`); return; }
+  const m = location.hash.match(/tile=([0-9A-Z]{5})/i);
+  if (m && S.byTile[m[1].toUpperCase()]) selectTile(m[1].toUpperCase(), true);
+  else if (S.grid) S.map.fitBounds(S.grid.getBounds(), { padding: [20, 20] });
+}
+init();
+</script>
+</body>
+</html>
