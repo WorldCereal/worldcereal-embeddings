@@ -171,6 +171,18 @@
   <div id="sp-plot" class="plot"></div>
 </div>
 
+<script type="module">
+// geotiff.js 2.x has no ZSTD (compression 50000) decoder; our COGs are ZSTD-compressed.
+// Register one backed by zstddec (WASM). Predictor handling is done by BaseDecoder.
+import { ZSTDDecoder } from 'https://cdn.jsdelivr.net/npm/zstddec@0.3.4/dist/zstddec-stream.mjs';
+const zstd = new ZSTDDecoder();
+window.ZSTD_READY = zstd.init().then(() => {
+  class ZstdDecoder extends GeoTIFF.BaseDecoder {
+    decodeBlock(buffer) { return zstd.decode(new Uint8Array(buffer)).slice().buffer; }
+  }
+  GeoTIFF.addDecoder(50000, () => Promise.resolve(ZstdDecoder));
+});
+</script>
 <script>
 'use strict';
 
@@ -385,6 +397,8 @@ function unloadTile() {
 // COG LOADING
 // ═══════════════════════════════════════════════════════════
 async function openCOG(u) {
+  while (!window.ZSTD_READY) await sleep(20);   // module script may run after this one
+  await window.ZSTD_READY;
   const tiff = await GeoTIFF.fromUrl(resolveUrl(u), { allowFullFile: false });
   const n = await tiff.getImageCount();
   const images = [];
