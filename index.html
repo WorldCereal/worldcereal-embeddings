@@ -195,7 +195,8 @@ const CFG = {
   COLORS: { on_s3:'#2ecc71', local:'#f39c12', todo:'#e74c3c' },
   NODATA: 255,
   THUMB_W: 512,          // overview width used for the tile-wide stretch
-  MAX_OUT: 1600,         // max rendered canvas side
+  MAX_OUT: 1280,         // max rendered canvas side
+  MAX_BLOCKS: 24,        // max COG blocks decoded per render (each = 8 MB for 128 pixel-interleaved bands)
   REFRESH_DELAY: 300,
   MAX_POINTS: 8,
   PT_COLORS: ['#ff6b6b','#4dabf7','#69db7c','#ffd43b','#da77f2','#ff922b','#3bc9db','#a9e34b'],
@@ -216,7 +217,7 @@ const T = {
   overlay: null, mode: 'emb', bands: [8, 64, 120],
   stretch: {},                  // key -> [{min,max} x3] or {min,max}
   view: null,                   // last rendered: {mode, arrays, window, outW, outH}
-  token: 0,
+  token: 0, seq: 0,
 };
 const PTS = [];                 // identified points
 
@@ -444,7 +445,15 @@ function pickOverview(target) {
 // Read arrays needed for the current mode over a full-res pixel window, resampled to outW x outH
 async function readMode(mode, win, outW, outH) {
   const [c0, r0, c1, r1] = win;
-  const img = pickOverview(Math.min(T.W, Math.round(outW * T.W / (c1 - c0))));
+  // Pixel-interleaved: every block holds all 128 bands (256*256*128 B = 8 MB decoded), so the cost
+  // is the number of blocks touched, regardless of how many bands we want. Pick the overview that
+  // matches the screen, then go coarser until the window touches at most MAX_BLOCKS blocks.
+  const imgs = T.emb.images;
+  let k = imgs.indexOf(pickOverview(Math.min(T.W, Math.round(outW * T.W / (c1 - c0)))));
+  const blocks = im => { const f = T.W / im.getWidth(), tw = im.getTileWidth(), th = im.getTileHeight();
+    return (Math.floor((c1 - 1) / f / tw) - Math.floor(c0 / f / tw) + 1) * (Math.floor((r1 - 1) / f / th) - Math.floor(r0 / f / th) + 1); };
+  while (k < imgs.length - 1 && blocks(imgs[k]) > CFG.MAX_BLOCKS) k++;
+  const img = imgs[k];
   const f = T.W / img.getWidth();
   const w = [Math.floor(c0 / f), Math.floor(r0 / f),
              Math.min(img.getWidth(), Math.ceil(c1 / f)), Math.min(img.getHeight(), Math.ceil(r1 / f))];
@@ -514,18 +523,21 @@ async function render(fit) {
   }
   const win = viewportWindow();
   if (!win) return;
-  const size = S.map.getSize(), dpr = window.devicePixelRatio || 1;
-  // output resolution: never finer than the native pixels in view
-  const outW = Math.max(16, Math.min(CFG.MAX_OUT, Math.round(size.x * dpr), win[2] - win[0]));
-  const outH = Math.max(16, Math.min(CFG.MAX_OUT, Math.round(size.y * dpr), win[3] - win[1]));
+  // Each render gets a sequence number; results of an older, slower render are dropped instead of
+  // being painted over the current view (that caused the 'sharp, then blurry' flip).
+  const seq = ++T.seq;
+  const bounds = S.map.getBounds(), size = S.map.getSize();
+  // output resolution: screen CSS pixels, never finer than the native pixels in view
+  const outW = Math.max(16, Math.min(CFG.MAX_OUT, size.x, win[2] - win[0]));
+  const outH = Math.max(16, Math.min(CFG.MAX_OUT, size.y, win[3] - win[1]));
   const mode = T.mode;
   status(`Reading ${T.props.tile} (${mode})…`, true);
   try {
     const st = await ensureStretch();
+    if (seq !== T.seq) return;
     const { arrays } = await readMode(mode, win, outW, outH);
-    if (tok !== T.token || mode !== T.mode) return;
-    const bounds = S.map.getBounds();
-    const dataURL = warp(arrays, mode, st, win, outW, outH, bounds);
+    if (tok !== T.token || seq !== T.seq || mode !== T.mode) return;
+    const dataURL = warp(arrays, mode, st, win, outW, outH, bounds, size);
     if (!T.overlay) T.overlay = L.imageOverlay(dataURL, bounds, { pane: 'raster', opacity: +$('opacity').value }).addTo(S.map);
     else { T.overlay.setUrl(dataURL); T.overlay.setBounds(bounds); }
     T.view = { mode, arrays, win, outW, outH };
@@ -538,11 +550,10 @@ async function render(fit) {
   }
 }
 
-function warp(arrays, mode, st, win, rW, rH, bounds) {
+function warp(arrays, mode, st, win, rW, rH, bounds, size) {
   const [c0, r0, c1, r1] = win, [ox, oy] = T.origin, [rx, ry] = T.res;
   const nMinX = ox + c0 * rx, nMaxX = ox + c1 * rx, nMaxY = oy + r0 * ry, nMinY = oy + r1 * ry;
-  const size = S.map.getSize(), dpr = window.devicePixelRatio || 1;
-  const outW = Math.min(CFG.MAX_OUT, Math.round(size.x * dpr)), outH = Math.min(CFG.MAX_OUT, Math.round(size.y * dpr));
+  const outW = Math.min(CFG.MAX_OUT, size.x), outH = Math.min(CFG.MAX_OUT, size.y);
   const M = 24, MW = M + 1;
   const west = bounds.getWest(), north = bounds.getNorth(), dLng = bounds.getEast() - west, dLat = north - bounds.getSouth();
   // mesh in Web Mercator y so rows are spaced like the screen
