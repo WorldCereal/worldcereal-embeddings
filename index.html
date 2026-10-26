@@ -61,6 +61,16 @@
   .dot { width:10px; height:10px; border-radius:50%; flex:none; }
   .leaflet-tooltip.tiletip { background:#1a1c28; color:var(--txt); border:1px solid var(--line); }
   .leaflet-container { background:#0d0e14; }
+  .tl { display:flex; align-items:center; gap:6px; font-size:12px; padding:2px 4px; border-radius:3px; }
+  .tl.act { background:#262a3d; }
+  .tl a { color:var(--txt); text-decoration:none; }
+  a.file { color:var(--txt); }
+  .tags { margin-top:6px; border:1px solid var(--line); border-radius:4px; padding:6px 8px; background:#14151f;
+          max-height:420px; overflow:auto; }
+  .tags .th { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--acc); margin:8px 0 3px; }
+  .tags .th:first-child { margin-top:0; }
+  .kv.wide { grid-template-columns:minmax(100px,38%) 1fr; }
+  .kv.wide div { word-break:break-word; }
 </style>
 </head>
 <body>
@@ -85,6 +95,9 @@
 
     <div class="sec" id="tile-sec">
       <h2>Selected tile</h2>
+      <label class="note" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer">
+        <input type="checkbox" id="multi"/> Select multiple tiles (compare neighbours / seams)</label>
+      <div id="tile-list"></div>
       <div id="tile-info" class="note">Click a tile on the map.</div>
     </div>
 
@@ -111,14 +124,14 @@
       </div>
       <div class="row">
         <button onclick="stretchFromView()" title="2–98 % stretch from the pixels in view">Stretch to view</button>
-        <button onclick="resetStretch()">Tile stretch</button>
+        <button onclick="resetStretch()" title="2–98 % stretch from overviews of all loaded tiles">Auto stretch</button>
       </div>
       <div id="legend-scale" class="note"></div>
     </div>
 
     <div class="sec" id="tools-sec" style="display:none">
       <h2>Tools</h2>
-      <div class="note" style="margin-bottom:6px">Click inside the loaded tile to identify a pixel (all 128 dimensions, dequantized).</div>
+      <div class="note" style="margin-bottom:6px">Click inside a loaded tile to identify a pixel (all 128 dimensions, dequantized).</div>
       <div class="row">
         <button id="btn-explore" onclick="toggleExplore()">3D explore (draw box)</button>
         <button id="btn-sampler" onclick="toggleSampler()">Class sampler</button>
@@ -198,6 +211,7 @@ const CFG = {
   MAX_OUT: 640,          // max rendered canvas side
   MAX_BLOCKS: 12,        // max COG blocks decoded per render (each = 8 MB for 128 pixel-interleaved bands)
   REFRESH_DELAY: 300,
+  MAX_TILES: 6,          // max tiles displayed at once with 'Select multiple'
   MAX_POINTS: 8,
   PT_COLORS: ['#ff6b6b','#4dabf7','#69db7c','#ffd43b','#da77f2','#ff922b','#3bc9db','#a9e34b'],
 };
@@ -206,26 +220,29 @@ const CFG = {
 // STATE
 // ═══════════════════════════════════════════════════════════
 const S = {
-  map: null, grid: null, gridData: null, byTile: {}, hl: null,
-  proxy: false, cors: null,       // cors: true/false once probed
+  map: null, grid: null, gridData: null, byTile: {},
+  cors: null,                     // true/false once probed
   pool: null,
 };
-// the loaded tile
-const T = {
-  props: null, loaded: false, emb: null, scl: null,
-  projDef: null, origin: null, res: null, W: 0, H: 0,
-  overlay: null, mode: 'emb', bands: [53, 67, 75],
-  stretch: {},                  // key -> [{min,max} x3] or {min,max}
-  view: null,                   // last rendered: {mode, arrays, window, outW, outH}
-  token: 0, seq: 0,
+// Display settings, shared by every loaded tile
+const V = {
+  mode: 'emb', bands: [53, 67, 75], multi: false, opacity: 1,
+  stretch: {},      // stretch key -> stretch fixed with "Stretch to view"
+  auto: {},         // stretch key + tile set -> automatic stretch, shared by all loaded tiles
+  seq: 0,           // render sequence number (late results of an older render are dropped)
+  tagsOpen: null,   // 'emb' | 'scl' | null
 };
+// Selected tiles in selection order. Each: {props, loaded, loading, failed, emb, scl, projDef,
+// origin, res, W, H, overlay, thumb, view, info, token}
+const TILES = [];
+let A = null;                   // active tile: shown in the info panel and drawn on top
 const PTS = [];                 // identified points
 
 // ═══════════════════════════════════════════════════════════
 // UTIL
 // ═══════════════════════════════════════════════════════════
 const $ = id => document.getElementById(id);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const show = id => { $(id).style.display = 'flex'; };
 const hide = id => { $(id).style.display = 'none'; };
@@ -233,6 +250,8 @@ function status(msg, busy) { $('status').innerHTML = (busy ? '<span class="spin"
 function fmtBytes(b) { if (!b) return ''; return b > 1e9 ? (b/1e9).toFixed(2)+' GB' : (b/1e6).toFixed(1)+' MB'; }
 function url(file) { return `${CFG.S3_BASE}/${file}`; }
 function resolveUrl(u) { return u; }
+const anyLoaded = () => TILES.some(t => t.loaded);
+const tileByName = name => TILES.find(t => t.props.tile === name);
 
 function projFor(epsg) {
   const key = `EPSG:${epsg}`;
@@ -282,8 +301,9 @@ function initMap() {
 }
 
 function gridStyle(f) {
-  const p = f.properties, sel = T.props && T.props.tile === p.tile;
-  return { color: sel ? '#ffffff' : CFG.COLORS[p.status], weight: sel ? 3 : 1.2,
+  const p = f.properties, sel = !!tileByName(p.tile), act = !!A && A.props.tile === p.tile;
+  return { color: sel ? '#ffffff' : CFG.COLORS[p.status], weight: act ? 3 : sel ? 2 : 1.2,
+           dashArray: sel && !act ? '6,4' : null,
            opacity: 0.9, fill: true, fillOpacity: sel ? 0 : 0.04, fillColor: CFG.COLORS[p.status] };
 }
 
@@ -305,7 +325,7 @@ function drawGrid() {
   if (S.grid) S.map.removeLayer(S.grid);
   const on = new Set([...document.querySelectorAll('.legend input[data-st]')].filter(i => i.checked).map(i => i.dataset.st));
   S.grid = L.geoJSON(S.gridData, {
-    filter: f => on.has(f.properties.status) || (T.props && T.props.tile === f.properties.tile),
+    filter: f => on.has(f.properties.status) || !!tileByName(f.properties.tile),
     style: gridStyle,
     onEachFeature: (f, lyr) => {
       const p = f.properties;
@@ -314,8 +334,9 @@ function drawGrid() {
       lyr.on('click', e => {
         L.DomEvent.stopPropagation(e);
         if (EX.mode || SAMPLER.mode) return;
-        if (T.loaded && insideTile(e.latlng)) identify(e.latlng);
-        else selectTile(p.tile);
+        const t = tileAt(e.latlng);
+        if (t) identify(e.latlng, t);   // inside a loaded tile: read the pixel
+        else selectTile(p.tile);        // otherwise select (or, in multi mode, add) this tile
       });
     },
   }).addTo(S.map);
@@ -332,26 +353,107 @@ function gotoTile() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// TILE SELECTION
+// TILE SELECTION (one tile, or several with "Select multiple")
 // ═══════════════════════════════════════════════════════════
+function tileBounds(t) { return L.geoJSON(S.byTile[t.props.tile]).getBounds(); }
+function fitSelection() {
+  const b = L.latLngBounds([]);
+  for (const t of TILES) b.extend(tileBounds(t));
+  if (b.isValid()) S.map.fitBounds(b, { padding: [30, 30] });
+}
+function updateHash() {
+  if (TILES.length) history.replaceState(null, '', '#tile=' + TILES.map(t => t.props.tile).join(','));
+  else history.replaceState(null, '', location.pathname);
+}
+
 function selectTile(tile, zoom) {
   const f = S.byTile[tile];
   if (!f) return;
-  unloadTile();
-  T.props = f.properties;
-  location.hash = 'tile=' + tile;
-  drawGrid();
-  const b = L.geoJSON(f).getBounds();
-  if (zoom || !S.map.getBounds().contains(b)) S.map.fitBounds(b, { padding: [30, 30] });
+  let t = tileByName(tile);
+  if (!t) {
+    if (!V.multi) clearTiles(true);
+    else if (TILES.length >= CFG.MAX_TILES) { status(`At most ${CFG.MAX_TILES} tiles at once: remove one first`); return; }
+    t = { props: f.properties, loaded: false, loading: false, failed: null, emb: null, scl: null,
+          overlay: null, thumb: {}, view: null, info: null, token: 0 };
+    TILES.push(t);
+  }
+  A = t;
+  updateHash(); drawGrid(); refreshPanels();
+  if (A.overlay) A.overlay.bringToFront();
+  const b = tileBounds(t);
+  if (zoom || !V.multi) S.map.fitBounds(b, { padding: [30, 30] });
+  else if (!S.map.getBounds().contains(b)) fitSelection();
+  if (t.props.status === 'on_s3') loadTile(t);
+}
+
+function setActive(name) {
+  const t = tileByName(name);
+  if (!t) return;
+  A = t;
+  if (t.overlay) t.overlay.bringToFront();   // the active tile is drawn on top where tiles overlap
+  drawGrid(); refreshPanels();
+}
+
+function removeTile(t, quiet) {
+  t.token++;
+  if (t.overlay) S.map.removeLayer(t.overlay);
+  t.overlay = null;
+  const i = TILES.indexOf(t);
+  if (i >= 0) TILES.splice(i, 1);
+  if (A === t) A = TILES[TILES.length - 1] || null;
+  if (quiet) return;
+  updateHash(); drawGrid(); refreshPanels(); scheduleRender();
+}
+function removeTileByName(name) { const t = tileByName(name); if (t) removeTile(t); }
+function clearTiles(quiet) {
+  for (const t of [...TILES]) removeTile(t, true);
+  if (!quiet) { updateHash(); drawGrid(); refreshPanels(); }
+}
+function closeTile() { if (A) removeTile(A); }
+function loadActive() { if (A) loadTile(A); }
+
+function setMulti(on) {
+  V.multi = on;
+  if (!on) for (const t of [...TILES]) if (t !== A) removeTile(t, true);
+  updateHash(); drawGrid(); refreshPanels(); scheduleRender();
+}
+
+function refreshPanels() {
+  renderTileList();
   renderTileInfo();
-  if (T.props.status === 'on_s3') loadTile();
+  const any = anyLoaded();
+  $('view-sec').style.display = any ? '' : 'none';
+  $('tools-sec').style.display = any ? '' : 'none';
+  if (!any) $('legend-scale').textContent = '';
+}
+
+function renderTileList() {
+  const el = $('tile-list');
+  if (!V.multi && TILES.length <= 1) { el.innerHTML = ''; return; }
+  if (!TILES.length) { el.innerHTML = '<div class="note">Click tiles on the map to add them.</div>'; return; }
+  el.innerHTML = TILES.map(t => {
+    const st = t.failed ? 'error' : t.loaded ? 'loaded' : t.loading ? 'loading…' : statusLabel(t.props.status);
+    return `<div class="tl ${t === A ? 'act' : ''}">
+      <span class="dot" style="background:${CFG.COLORS[t.props.status]}"></span>
+      <a href="#" title="Show this tile's details and draw it on top" onclick="setActive('${t.props.tile}');return false"><b>${t.props.tile}</b></a>
+      <span class="note">${esc(st)}</span><span style="margin-left:auto"></span>
+      <a href="#" title="Remove" onclick="removeTileByName('${t.props.tile}');return false">✕</a></div>`;
+  }).join('') + `<div class="row"><button onclick="clearTiles()">Clear all</button>
+      <span class="note">${TILES.length}/${CFG.MAX_TILES} tiles · one shared colour stretch</span></div>`;
 }
 
 function renderTileInfo() {
-  const p = T.props;
-  if (!p) { $('tile-info').innerHTML = '<span class="note">Click a tile on the map.</span>'; return; }
-  const onS3 = p.status === 'on_s3';
+  const t = A;
+  if (!t) {
+    $('tile-info').innerHTML = `<span class="note">${V.multi ? 'Click tiles on the map to add them.' : 'Click a tile on the map.'}</span>`;
+    return;
+  }
+  const p = t.props, onS3 = p.status === 'on_s3';
   const eu = url(p.emb_file), su = url(p.scale_file);
+  const loadBtn = t.loaded ? '<button disabled>Loaded</button>'
+    : t.loading ? '<button disabled>Loading…</button>'
+    : `<button onclick="loadActive()">${t.failed ? 'Retry' : 'Load in viewer'}</button>`;
+  const tagBtn = (w, label) => `<button class="${V.tagsOpen === w ? 'active' : ''}" onclick="toggleTags('${w}')">${label}</button>`;
   $('tile-info').innerHTML = `
     <div class="row" style="margin-top:0"><b style="font-size:15px">${p.tile}</b>
       <span class="pill" style="background:${CFG.COLORS[p.status]}">${statusLabel(p.status)}</span></div>
@@ -367,31 +469,78 @@ function renderTileInfo() {
       <a class="btn" href="${su}" download title="${esc(p.scale_file)}">⬇ Scale ${fmtBytes(p.scale_bytes)}</a>
       <a class="btn" href="${su}.aux.xml" download title="scale statistics (GDAL .aux.xml)">⬇ .aux.xml</a>
     </div>
-    <div class="row"><button onclick="copyLinks()">Copy https links</button>
-      <button onclick="loadTile()" ${T.loaded ? 'disabled' : ''}>${T.loaded ? 'Loaded' : 'Load in viewer'}</button>
-      <button onclick="closeTile()">Close</button></div>
-    <div class="mono note" style="margin-top:4px">${esc(p.emb_file)}<br>${esc(p.scale_file)}</div>`
+    <div class="row"><button onclick="copyLinks()">Copy https links</button>${loadBtn}
+      <button onclick="closeTile()">${V.multi ? 'Remove' : 'Close'}</button></div>
+    <div class="mono note" style="margin-top:4px">
+      <a href="#" class="file" title="Show this file's tags" onclick="toggleTags('emb');return false">${esc(p.emb_file)}</a><br>
+      <a href="#" class="file" title="Show this file's tags" onclick="toggleTags('scl');return false">${esc(p.scale_file)}</a></div>
+    <div class="row">Tags: ${tagBtn('emb', 'Embeddings file')} ${tagBtn('scl', 'Scale file')}</div>
+    ${V.tagsOpen ? tagsHtml(t, V.tagsOpen) : ''}`
     : `<div class="note" style="margin-top:8px">${p.status === 'local'
          ? 'Processed, waiting to be uploaded to S3. Downloads and viewing become available once it is on S3.'
          : 'Not processed yet.'}</div>
-       <div class="row"><button onclick="closeTile()">Close</button></div>`}`;
+       <div class="row"><button onclick="closeTile()">${V.multi ? 'Remove' : 'Close'}</button></div>`}`;
 }
 
 function copyLinks() {
-  const p = T.props;
+  const p = A.props;
   navigator.clipboard.writeText([url(p.emb_file), url(p.scale_file)].join('\n'))
     .then(() => status('Links copied'), () => status('Copy failed'));
 }
 
-function closeTile() { unloadTile(); T.props = null; history.replaceState(null, '', location.pathname); drawGrid(); renderTileInfo(); }
-
-function unloadTile() {
-  T.token++;
-  if (T.overlay) S.map.removeLayer(T.overlay);
-  Object.assign(T, { loaded: false, emb: null, scl: null, overlay: null, stretch: {}, view: null });
-  $('view-sec').style.display = 'none';
-  $('tools-sec').style.display = 'none';
-  $('legend-scale').textContent = '';
+// ═══════════════════════════════════════════════════════════
+// FILE TAGS (read from the COG header, already fetched to open the file)
+// ═══════════════════════════════════════════════════════════
+const COMPRESSION = { 1: 'none', 5: 'LZW', 7: 'JPEG', 8: 'DEFLATE', 32946: 'DEFLATE', 34887: 'LERC', 50000: 'ZSTD' };
+const unescapeXml = s => String(s ?? '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+  .replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n)).replace(/&amp;/g, '&');
+function gdalMeta(img, sample) {
+  const m = img.getGDALMetadata(sample) || {}, out = {};
+  for (const k of Object.keys(m).sort()) out[k] = unescapeXml(m[k]);
+  return out;
+}
+function fileInfo(cog, epsg) {
+  const img = cog.images[0], fd = img.fileDirectory, W = img.getWidth(), H = img.getHeight();
+  const first = v => (Array.isArray(v) || ArrayBuffer.isView(v)) ? v[0] : v;
+  const sf = first(fd.SampleFormat) || 1, bits = first(fd.BitsPerSample);
+  const [ox, oy] = img.getOrigin(), [rx] = img.getResolution();
+  const nd = img.getGDALNoData();
+  return {
+    structure: {
+      'Size': `${W} × ${H} px`,
+      'Bands': img.getSamplesPerPixel(),
+      'Data type': `${{ 1: 'uint', 2: 'int', 3: 'float' }[sf] || 'uint'}${bits}`,
+      'NoData': nd === null ? '–' : String(nd),
+      'Compression': COMPRESSION[fd.Compression] || fd.Compression,
+      'Predictor': fd.Predictor || 1,
+      'Interleave': fd.PlanarConfiguration === 2 ? 'BAND' : 'PIXEL',
+      'Block size': `${img.getTileWidth()} × ${img.getTileHeight()}`,
+      'Overviews': cog.images.slice(1).map(i => Math.round(W / i.getWidth())).join(', ') || 'none',
+      'CRS': `EPSG:${epsg}`,
+      'Pixel size': `${rx} m`,
+      'Origin (UL)': `${ox}, ${oy}`,
+    },
+    dataset: gdalMeta(img, null),
+    band1: gdalMeta(img, 0),
+  };
+}
+function tagsHtml(t, which) {
+  const info = t.info && t.info[which];
+  if (!info) return `<div class="tags note">${t.failed ? 'Could not read the file.' : t.loading ? 'Reading tags…' : 'Load the tile to read its tags.'}</div>`;
+  const rows = o => Object.entries(o).map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join('') || '<div>–</div><div></div>';
+  return `<div class="tags">
+    <div class="th">File structure</div><div class="kv wide">${rows(info.structure)}</div>
+    <div class="th">Dataset tags · ${Object.keys(info.dataset).length}</div><div class="kv wide mono">${rows(info.dataset)}</div>
+    <div class="th">Band 1 tags</div><div class="kv wide mono">${rows(info.band1)}</div>
+    <div class="row"><button onclick="copyTags('${which}')">Copy as JSON</button></div>
+  </div>`;
+}
+function toggleTags(which) { V.tagsOpen = V.tagsOpen === which ? null : which; renderTileInfo(); }
+function copyTags(which) {
+  const info = A && A.info && A.info[which];
+  if (!info) return;
+  navigator.clipboard.writeText(JSON.stringify(info, null, 2))
+    .then(() => status('Tags copied'), () => status('Copy failed'));
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -408,60 +557,64 @@ async function openCOG(u) {
   return { tiff, images };
 }
 
-async function loadTile() {
-  if (!T.props || T.loaded) return;
-  const tok = ++T.token, p = T.props;
+async function loadTile(t) {
+  if (!t || t.loaded || t.loading || t.props.status !== 'on_s3') return;
+  const tok = ++t.token, p = t.props;
+  t.loading = true; t.failed = null;
+  refreshPanels();
   status(`Opening ${p.tile}…`, true);
   try {
     if (S.cors === null) await probeCors(url(p.scale_file));
     const [emb, scl] = await Promise.all([openCOG(url(p.emb_file)), openCOG(url(p.scale_file))]);
-    if (tok !== T.token) return;
+    if (tok !== t.token) return;
     const full = emb.images[0];
     if (scl.images[0].getWidth() !== full.getWidth() || scl.images[0].getHeight() !== full.getHeight())
       throw new Error('embeddings and scale grids differ');
-    Object.assign(T, {
+    Object.assign(t, {
       emb, scl, projDef: projFor(p.epsg), origin: full.getOrigin(), res: full.getResolution(),
-      W: full.getWidth(), H: full.getHeight(), loaded: true,
+      W: full.getWidth(), H: full.getHeight(), loaded: true, loading: false,
     });
-    $('view-sec').style.display = '';
-    $('tools-sec').style.display = '';
-    renderTileInfo();
-    await render(true);
+    try { t.info = { emb: fileInfo(emb, p.epsg), scl: fileInfo(scl, p.epsg) }; }
+    catch (e) { console.warn('tags', e); }
+    refreshPanels();
+    await render();
   } catch (err) {
-    if (tok !== T.token) return;
+    if (tok !== t.token) return;
     console.error(err);
+    t.loading = false; t.failed = err.message;
+    refreshPanels();
     status(`Could not open ${p.tile}: ${err.message}`);
     if (S.cors === false) showCorsWarning();
   }
 }
 
 // the scale overview with the same width as the chosen embeddings overview
-function pair(img) { return T.scl.images.find(i => i.getWidth() === img.getWidth()) || T.scl.images[0]; }
-function pickOverview(target) {
-  const imgs = T.emb.images, ok = imgs.filter(i => i.getWidth() >= target);
+function pair(t, img) { return t.scl.images.find(i => i.getWidth() === img.getWidth()) || t.scl.images[0]; }
+function pickOverview(t, target) {
+  const imgs = t.emb.images, ok = imgs.filter(i => i.getWidth() >= target);
   return ok.length ? ok[ok.length - 1] : imgs[0];
 }
 
-// Read arrays needed for the current mode over a full-res pixel window, resampled to outW x outH
-async function readMode(mode, win, outW, outH) {
+// Read arrays needed for *mode* over a full-res pixel window of tile *t*, resampled to outW x outH
+async function readMode(t, mode, bands, win, outW, outH) {
   const [c0, r0, c1, r1] = win;
   // Pixel-interleaved: every block holds all 128 bands (256*256*128 B = 8 MB decoded), so the cost
   // is the number of blocks touched, regardless of how many bands we want. Pick the overview that
   // matches the screen, then go coarser until the window touches at most MAX_BLOCKS blocks.
-  const imgs = T.emb.images;
-  let k = imgs.indexOf(pickOverview(Math.min(T.W, Math.round(outW * T.W / (c1 - c0)))));
-  const blocks = im => { const f = T.W / im.getWidth(), tw = im.getTileWidth(), th = im.getTileHeight();
+  const imgs = t.emb.images;
+  let k = imgs.indexOf(pickOverview(t, Math.min(t.W, Math.round(outW * t.W / (c1 - c0)))));
+  const blocks = im => { const f = t.W / im.getWidth(), tw = im.getTileWidth(), th = im.getTileHeight();
     return (Math.floor((c1 - 1) / f / tw) - Math.floor(c0 / f / tw) + 1) * (Math.floor((r1 - 1) / f / th) - Math.floor(r0 / f / th) + 1); };
   while (k < imgs.length - 1 && blocks(imgs[k]) > CFG.MAX_BLOCKS) k++;
   const img = imgs[k];
-  const f = T.W / img.getWidth();
+  const f = t.W / img.getWidth();
   const w = [Math.floor(c0 / f), Math.floor(r0 / f),
              Math.min(img.getWidth(), Math.ceil(c1 / f)), Math.min(img.getHeight(), Math.ceil(r1 / f))];
   const opts = { window: w, width: outW, height: outH, interleave: false, pool: S.pool };
   const need = { emb: [true, false], deq: [true, true], scale: [false, true] }[mode];
   const [q, s] = await Promise.all([
-    need[0] ? img.readRasters({ ...opts, samples: T.bands.map(b => b - 1), fillValue: CFG.NODATA }) : null,
-    need[1] ? pair(img).readRasters({ ...opts, samples: [0], fillValue: NaN }) : null,
+    need[0] ? img.readRasters({ ...opts, samples: bands.map(b => b - 1), fillValue: CFG.NODATA }) : null,
+    need[1] ? pair(t, img).readRasters({ ...opts, samples: [0], fillValue: NaN }) : null,
   ]);
   let arrays;
   if (mode === 'emb') arrays = [q[0], q[1], q[2]];
@@ -484,78 +637,114 @@ function computeStretch(mode, arrays) {
   const v = validFn(mode, arrays);
   return mode === 'scale' ? [pstretch(arrays[0], v)] : arrays.map(a => pstretch(a, v));
 }
-function stretchKey() { return T.mode === 'scale' ? 'scale' : `${T.mode}:${T.bands.join(',')}`; }
+function stretchKey() { return V.mode === 'scale' ? 'scale' : `${V.mode}:${V.bands.join(',')}`; }
+// channel-wise concatenation of [[ch0, ch1, ch2], ...] from several tiles
+function concatChannels(list) {
+  return list[0].map((_, k) => {
+    const parts = list.map(a => a[k]);
+    const out = new parts[0].constructor(parts.reduce((n, a) => n + a.length, 0));
+    let o = 0;
+    for (const a of parts) { out.set(a, o); o += a.length; }
+    return out;
+  });
+}
 
-// tile-wide stretch from a coarse overview
-async function ensureStretch() {
+// coarse whole-tile read used for the automatic stretch
+async function thumbOf(t, key, mode, bands) {
+  if (!t.thumb[key]) {
+    const w = Math.min(CFG.THUMB_W, t.W), h = Math.max(1, Math.round(t.H * w / t.W));
+    t.thumb[key] = (await readMode(t, mode, bands, [0, 0, t.W, t.H], w, h)).arrays;
+  }
+  return t.thumb[key];
+}
+// One stretch for all loaded tiles, so colours are comparable across tile edges (a per-tile
+// stretch would itself create seams).
+async function ensureStretch(ready, mode, bands) {
   const key = stretchKey();
-  if (T.stretch[key]) return T.stretch[key];
-  const w = Math.min(CFG.THUMB_W, T.W), h = Math.max(1, Math.round(T.H * w / T.W));
-  const { arrays } = await readMode(T.mode, [0, 0, T.W, T.H], w, h);
-  return (T.stretch[key] = computeStretch(T.mode, arrays));
+  if (V.stretch[key]) return V.stretch[key];
+  const id = key + '|' + ready.map(t => t.props.tile).sort().join(',');
+  if (!V.auto[id]) {
+    const list = [];
+    for (const t of ready) list.push(await thumbOf(t, key, mode, bands));
+    V.auto[id] = computeStretch(mode, concatChannels(list));
+  }
+  return V.auto[id];
 }
 
 // ═══════════════════════════════════════════════════════════
-// RENDERING (on-the-fly UTM -> Web Mercator warp of the viewport)
+// RENDERING (on-the-fly UTM -> Web Mercator warp of the viewport, one overlay per tile)
 // ═══════════════════════════════════════════════════════════
 let renderTimer = null;
-function scheduleRender() { clearTimeout(renderTimer); renderTimer = setTimeout(() => render(false), CFG.REFRESH_DELAY); }
+function scheduleRender() { clearTimeout(renderTimer); renderTimer = setTimeout(() => render(), CFG.REFRESH_DELAY); }
 
-function viewportWindow() {
-  const mb = S.map.getBounds(), [ox, oy] = T.origin, [rx, ry] = T.res;
+function viewportWindow(t) {
+  const mb = S.map.getBounds(), [ox, oy] = t.origin, [rx, ry] = t.res;
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   const lats = [mb.getSouth(), (mb.getSouth() + mb.getNorth()) / 2, mb.getNorth()];
   const lngs = [mb.getWest(), (mb.getWest() + mb.getEast()) / 2, mb.getEast()];
   for (const la of lats) for (const ln of lngs) {
-    try { const { x, y } = fromLL(T.projDef, la, ln); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); } catch (e) {}
+    try { const { x, y } = fromLL(t.projDef, la, ln); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); } catch (e) {}
   }
-  const c0 = Math.max(0, Math.floor((x0 - ox) / rx)), c1 = Math.min(T.W, Math.ceil((x1 - ox) / rx));
-  const r0 = Math.max(0, Math.floor((y1 - oy) / ry)), r1 = Math.min(T.H, Math.ceil((y0 - oy) / ry));
+  const c0 = Math.max(0, Math.floor((x0 - ox) / rx)), c1 = Math.min(t.W, Math.ceil((x1 - ox) / rx));
+  const r0 = Math.max(0, Math.floor((y1 - oy) / ry)), r1 = Math.min(t.H, Math.ceil((y0 - oy) / ry));
   return c0 < c1 && r0 < r1 ? [c0, r0, c1, r1] : null;
 }
 
-async function render(fit) {
-  if (!T.loaded) return;
-  const tok = T.token;
-  if (fit) {
-    const f = S.byTile[T.props.tile];
-    S.map.fitBounds(L.geoJSON(f).getBounds(), { padding: [30, 30], animate: false });
-  }
-  const win = viewportWindow();
-  if (!win) return;
+async function render() {
+  const ready = TILES.filter(t => t.loaded);
+  if (!ready.length) return;
   // Each render gets a sequence number; results of an older, slower render are dropped instead of
   // being painted over the current view (that caused the 'sharp, then blurry' flip).
-  const seq = ++T.seq;
+  const seq = ++V.seq, mode = V.mode, bands = [...V.bands];
   const bounds = S.map.getBounds(), size = S.map.getSize();
-  // output resolution: screen CSS pixels, never finer than the native pixels in view
-  const outW = Math.max(16, Math.min(CFG.MAX_OUT, size.x, win[2] - win[0]));
-  const outH = Math.max(16, Math.min(CFG.MAX_OUT, size.y, win[3] - win[1]));
-  const mode = T.mode;
-  status(`Reading ${T.props.tile} (${mode})…`, true);
+  // the active tile first (it is the one you are looking at), then the others one by one,
+  // so memory stays at one tile's read at a time
+  const order = [...ready].sort((a, b) => (b === A) - (a === A));
+  const label = ready.length > 1 ? `${ready.length} tiles` : ready[0].props.tile;
+  status(`Reading ${label} (${mode})…`, true);
   try {
-    const st = await ensureStretch();
-    if (seq !== T.seq) return;
-    const { arrays } = await readMode(mode, win, outW, outH);
-    if (tok !== T.token || seq !== T.seq || mode !== T.mode) return;
-    const dataURL = warp(arrays, mode, st, win, outW, outH, bounds, size);
-    if (!T.overlay) T.overlay = L.imageOverlay(dataURL, bounds, { pane: 'raster', opacity: +$('opacity').value }).addTo(S.map);
-    else { T.overlay.setUrl(dataURL); T.overlay.setBounds(bounds); }
-    T.view = { mode, arrays, win, outW, outH };
-    updateScaleLegend(st);
-    status(`${T.props.tile} · ${win[2] - win[0]}×${win[3] - win[1]} px in view · ${mode === 'scale' ? 'scale' : 'bands ' + T.bands.join('/')}`);
+    const st = await ensureStretch(ready, mode, bands);
+    if (seq !== V.seq) return;
+    let shown = 0;
+    for (const t of order) {
+      const win = viewportWindow(t);
+      if (!win) {   // tile not in view
+        if (t.overlay) { S.map.removeLayer(t.overlay); t.overlay = null; }
+        t.view = null;
+        continue;
+      }
+      // output resolution: screen CSS pixels, never finer than the native pixels in view
+      const outW = Math.max(16, Math.min(CFG.MAX_OUT, size.x, win[2] - win[0]));
+      const outH = Math.max(16, Math.min(CFG.MAX_OUT, size.y, win[3] - win[1]));
+      const tok = t.token;
+      const { arrays } = await readMode(t, mode, bands, win, outW, outH);
+      if (seq !== V.seq || mode !== V.mode) return;
+      if (tok !== t.token || !TILES.includes(t)) continue;   // removed meanwhile
+      const dataURL = warp(t, arrays, mode, st, win, outW, outH, bounds, size);
+      if (!t.overlay) t.overlay = L.imageOverlay(dataURL, bounds, { pane: 'raster', opacity: V.opacity }).addTo(S.map);
+      else { t.overlay.setUrl(dataURL); t.overlay.setBounds(bounds); }
+      t.view = { mode, arrays };
+      shown++;
+      // where tiles overlap: selection order, the active tile on top
+      for (const x of TILES) if (x.overlay) x.overlay.bringToFront();
+      if (A && A.overlay) A.overlay.bringToFront();
+    }
+    updateScaleLegend(st, ready.length);
+    const what = mode === 'scale' ? 'scale' : `${mode === 'deq' ? 'dequantized ' : ''}bands ${bands.join('/')}`;
+    status(ready.length > 1 ? `${shown} of ${ready.length} tiles in view · ${what}` : `${label} · ${what}`);
   } catch (err) {
-    if (tok !== T.token) return;
+    if (seq !== V.seq) return;
     console.error(err);
     status(`Read error: ${err.message}`);
   }
 }
 
-function warp(arrays, mode, st, win, rW, rH, bounds, size) {
-  const [c0, r0, c1, r1] = win, [ox, oy] = T.origin, [rx, ry] = T.res;
+function warp(t, arrays, mode, st, win, rW, rH, bounds, size) {
+  const [c0, r0, c1, r1] = win, [ox, oy] = t.origin, [rx, ry] = t.res;
   const nMinX = ox + c0 * rx, nMaxX = ox + c1 * rx, nMaxY = oy + r0 * ry, nMinY = oy + r1 * ry;
   const outW = Math.min(CFG.MAX_OUT, size.x), outH = Math.min(CFG.MAX_OUT, size.y);
   const M = 24, MW = M + 1;
-  const west = bounds.getWest(), north = bounds.getNorth(), dLng = bounds.getEast() - west, dLat = north - bounds.getSouth();
+  const west = bounds.getWest(), north = bounds.getNorth(), dLng = bounds.getEast() - west;
   // mesh in Web Mercator y so rows are spaced like the screen
   const mY = lat => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
   const yN = mY(north), yS = mY(bounds.getSouth());
@@ -564,7 +753,7 @@ function warp(arrays, mode, st, win, rW, rH, bounds, size) {
     const yy = yN + (yS - yN) * j / M, lat = (2 * Math.atan(Math.exp(yy)) - Math.PI / 2) * 180 / Math.PI;
     for (let i = 0; i < MW; i++) {
       const lng = west + dLng * i / M;
-      try { const [x, y] = proj4('WGS84', T.projDef, [lng, lat]);
+      try { const [x, y] = proj4('WGS84', t.projDef, [lng, lat]);
             mc[j * MW + i] = (x - nMinX) / (nMaxX - nMinX) * rW; mr[j * MW + i] = (nMaxY - y) / (nMaxY - nMinY) * rH; }
       catch (e) { mc[j * MW + i] = -1; mr[j * MW + i] = -1; }
     }
@@ -601,21 +790,23 @@ function warp(arrays, mode, st, win, rW, rH, bounds, size) {
   return cv.toDataURL('image/png');
 }
 
-function updateScaleLegend(st) {
-  if (T.mode !== 'scale') {
-    $('legend-scale').textContent = `Stretch: ` + st.map((s, i) => `${'RGB'[i]} ${s.min.toFixed(T.mode === 'emb' ? 0 : 3)}…${s.max.toFixed(T.mode === 'emb' ? 0 : 3)}`).join(' · ');
+function updateScaleLegend(st, nTiles) {
+  const src = (V.stretch[stretchKey()] ? 'from view' : 'automatic') + (nTiles > 1 ? `, shared by ${nTiles} tiles` : '');
+  if (V.mode !== 'scale') {
+    const dp = V.mode === 'emb' ? 0 : 3;
+    $('legend-scale').textContent = `Stretch (${src}): ` + st.map((s, i) => `${'RGB'[i]} ${s.min.toFixed(dp)}…${s.max.toFixed(dp)}`).join(' · ');
     return;
   }
   const g = VIRIDIS.map(c => `rgb(${c})`).join(',');
   $('legend-scale').innerHTML = `<div style="height:10px;border-radius:2px;background:linear-gradient(90deg,${g})"></div>
-    <div class="row" style="justify-content:space-between;margin:2px 0"><span>${st[0].min.toPrecision(3)}</span><span>scale</span><span>${st[0].max.toPrecision(3)}</span></div>`;
+    <div class="row" style="justify-content:space-between;margin:2px 0"><span>${st[0].min.toPrecision(3)}</span><span>scale (${esc(src)})</span><span>${st[0].max.toPrecision(3)}</span></div>`;
 }
 
-function setMode(m) { T.mode = m; $('band-row').style.display = m === 'scale' ? 'none' : ''; render(false); }
+function setMode(m) { V.mode = m; $('band-row').style.display = m === 'scale' ? 'none' : ''; render(); }
 function applyBands() {
   const b = ['b-r', 'b-g', 'b-b'].map(id => parseInt($(id).value));
   if (b.some(v => !(v >= 1 && v <= 128))) { status('Bands must be 1–128'); return; }
-  T.bands = b; render(false);
+  V.bands = b; render();
 }
 function randomBands() {
   const a = Math.floor(Math.random() * 43);
@@ -624,45 +815,54 @@ function randomBands() {
   applyBands();
 }
 function stretchFromView() {
-  if (!T.view || T.view.mode !== T.mode) return;
-  T.stretch[stretchKey()] = computeStretch(T.mode, T.view.arrays);
-  render(false);
+  const views = TILES.filter(t => t.view && t.view.mode === V.mode).map(t => t.view.arrays);
+  if (!views.length) return;
+  V.stretch[stretchKey()] = computeStretch(V.mode, concatChannels(views));
+  render();
 }
-function resetStretch() { delete T.stretch[stretchKey()]; render(false); }
+function resetStretch() { delete V.stretch[stretchKey()]; render(); }
+function setOpacity(v) { V.opacity = v; for (const t of TILES) if (t.overlay) t.overlay.setOpacity(v); }
 
 // ═══════════════════════════════════════════════════════════
 // PIXEL IDENTIFY
 // ═══════════════════════════════════════════════════════════
-function pixelOf(latlng) {
-  const { x, y } = fromLL(T.projDef, latlng.lat, latlng.lng);
-  return { col: Math.floor((x - T.origin[0]) / T.res[0]), row: Math.floor((y - T.origin[1]) / T.res[1]) };
+function pixelOf(t, latlng) {
+  const { x, y } = fromLL(t.projDef, latlng.lat, latlng.lng);
+  return { col: Math.floor((x - t.origin[0]) / t.res[0]), row: Math.floor((y - t.origin[1]) / t.res[1]) };
 }
-function insideTile(latlng) {
-  if (!T.loaded) return false;
-  const { col, row } = pixelOf(latlng);
-  return col >= 0 && row >= 0 && col < T.W && row < T.H;
+function insideTile(t, latlng) {
+  if (!t.loaded) return false;
+  const { col, row } = pixelOf(t, latlng);
+  return col >= 0 && row >= 0 && col < t.W && row < t.H;
+}
+// the loaded tile under *latlng*, in drawing order (active tile first, then the latest selected)
+function tileAt(latlng) {
+  const order = [...TILES].reverse();
+  if (A) order.unshift(A);
+  return order.find(t => insideTile(t, latlng)) || null;
 }
 function onMapClick(latlng) {
   if (EX.mode || SAMPLER.mode) return;
-  if (insideTile(latlng)) identify(latlng);
+  const t = tileAt(latlng);
+  if (t) identify(latlng, t);
 }
 
-async function identify(latlng) {
-  const { col, row } = pixelOf(latlng);
+async function identify(latlng, t) {
+  const { col, row } = pixelOf(t, latlng);
   show('px');
-  status('Reading pixel (128 bands + scale, full resolution)…', true);
+  status(`Reading pixel of ${t.props.tile} (128 bands + scale, full resolution)…`, true);
   try {
     const win = [col, row, col + 1, row + 1];
     const [q, s] = await Promise.all([
-      T.emb.images[0].readRasters({ window: win, interleave: true, pool: S.pool }),
-      T.scl.images[0].readRasters({ window: win, samples: [0], interleave: true }),
+      t.emb.images[0].readRasters({ window: win, interleave: true, pool: S.pool }),
+      t.scl.images[0].readRasters({ window: win, samples: [0], interleave: true }),
     ]);
     const qv = Array.from(q), sc = s[0];
     const nodata = qv[0] === CFG.NODATA || !isFinite(sc);
     const deq = nodata ? null : qv.map(v => (v - 128) * sc);
     if (PTS.length >= CFG.MAX_POINTS) { const old = PTS.shift(); S.map.removeLayer(old.marker); }
     const color = CFG.PT_COLORS[(PTS.length ? PTS[PTS.length - 1].ci + 1 : 0) % CFG.PT_COLORS.length];
-    const pt = { tile: T.props.tile, lat: latlng.lat, lng: latlng.lng, col, row, q: qv, scale: sc, deq, nodata, color,
+    const pt = { tile: t.props.tile, lat: latlng.lat, lng: latlng.lng, col, row, q: qv, scale: sc, deq, nodata, color,
                  ci: CFG.PT_COLORS.indexOf(color) };
     pt.marker = L.circleMarker(latlng, { pane: 'draw', radius: 6, color: '#fff', weight: 2, fillColor: color, fillOpacity: 1 }).addTo(S.map);
     PTS.push(pt);
@@ -685,7 +885,7 @@ function renderPoints() {
       <a href="#" onclick="copyVec(${i},'q');return false" title="copy uint8 vector">q</a>`}</div>`;
   }).join('');
   const traces = PTS.filter(p => p.deq).map(p => ({
-    type: 'scatter', mode: 'lines', name: `${p.lat.toFixed(4)}, ${p.lng.toFixed(4)}`,
+    type: 'scatter', mode: 'lines', name: `${p.tile} ${p.lat.toFixed(4)}, ${p.lng.toFixed(4)}`,
     x: p.deq.map((_, i) => i), y: p.deq, line: { color: p.color, width: 1.5 },
     hovertemplate: 'dim %{x}: %{y:.4f}<extra></extra>',
   }));
@@ -707,23 +907,26 @@ function clearPoints() { for (const p of PTS) S.map.removeLayer(p.marker); PTS.l
 // READ ALL 128 DIMENSIONS (dequantized) FOR A BOX
 // ═══════════════════════════════════════════════════════════
 async function readBoxVectors(bounds, maxDim, maxPts) {
+  // the loaded tile under the centre of the box
+  const t = tileAt(bounds.getCenter());
+  if (!t) throw new Error('the box is not on a loaded tile');
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const [la, ln] of [[bounds.getSouth(), bounds.getWest()], [bounds.getSouth(), bounds.getEast()],
                           [bounds.getNorth(), bounds.getWest()], [bounds.getNorth(), bounds.getEast()]]) {
-    const { x, y } = fromLL(T.projDef, la, ln);
+    const { x, y } = fromLL(t.projDef, la, ln);
     x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
   }
-  const [ox, oy] = T.origin, [rx, ry] = T.res;
-  const c0 = Math.max(0, Math.floor((x0 - ox) / rx)), c1 = Math.min(T.W, Math.ceil((x1 - ox) / rx));
-  const r0 = Math.max(0, Math.floor((y1 - oy) / ry)), r1 = Math.min(T.H, Math.ceil((y0 - oy) / ry));
+  const [ox, oy] = t.origin, [rx, ry] = t.res;
+  const c0 = Math.max(0, Math.floor((x0 - ox) / rx)), c1 = Math.min(t.W, Math.ceil((x1 - ox) / rx));
+  const r0 = Math.max(0, Math.floor((y1 - oy) / ry)), r1 = Math.min(t.H, Math.ceil((y0 - oy) / ry));
   if (c0 >= c1 || r0 >= r1) throw new Error('box is outside the loaded tile');
-  const img = pickOverview(Math.min(T.W, Math.round(maxDim * T.W / (c1 - c0))));
-  const f = T.W / img.getWidth();
+  const img = pickOverview(t, Math.min(t.W, Math.round(maxDim * t.W / (c1 - c0))));
+  const f = t.W / img.getWidth();
   const w = [Math.floor(c0 / f), Math.floor(r0 / f), Math.min(img.getWidth(), Math.ceil(c1 / f)), Math.min(img.getHeight(), Math.ceil(r1 / f))];
   const oW = Math.max(1, w[2] - w[0]), oH = Math.max(1, w[3] - w[1]);
   const [q, s] = await Promise.all([
     img.readRasters({ window: w, interleave: false, fillValue: CFG.NODATA, pool: S.pool }),
-    pair(img).readRasters({ window: w, samples: [0], interleave: false, fillValue: NaN }),
+    pair(t, img).readRasters({ window: w, samples: [0], interleave: false, fillValue: NaN }),
   ]);
   const n = oW * oH, step = Math.max(1, Math.floor(n / maxPts)), nb = q.length, out = [];
   for (let i = 0; i < n; i += step) {
@@ -733,7 +936,7 @@ async function readBoxVectors(bounds, maxDim, maxPts) {
     for (let b = 0; b < nb; b++) v[b] = (q[b][i] - 128) * sc;
     out.push(v);
   }
-  return { vectors: out, w: oW, h: oH, factor: f };
+  return { vectors: out, w: oW, h: oH, factor: f, tile: t.props.tile };
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -802,7 +1005,7 @@ const LAYOUT3D = () => ({ paper_bgcolor: '#10111a', margin: { l: 0, r: 0, t: 0, 
 const EX = { mode: false, cancel: null, rect: null };
 function toggleExplore() {
   if (EX.mode) { EX.cancel(); exploreOff(); return; }
-  if (!T.loaded) { status('Load a tile first'); return; }
+  if (!anyLoaded()) { status('Load a tile first'); return; }
   if (SAMPLER.mode) { SAMPLER.cancel(); samplerDrawOff(); }
   EX.mode = true; $('btn-explore').classList.add('active');
   if (EX.rect) { S.map.removeLayer(EX.rect); EX.rect = null; }
@@ -844,7 +1047,7 @@ function closeSampler() { if (SAMPLER.mode) { SAMPLER.cancel(); samplerDrawOff()
 function samplerDrawOff() { SAMPLER.mode = false; $('sp-draw').classList.remove('active'); $('sp-draw').textContent = '✏ Draw box'; }
 function startSamplerDraw() {
   if (SAMPLER.mode) { SAMPLER.cancel(); samplerDrawOff(); return; }
-  if (!T.loaded) { $('sp-status').textContent = 'Load a tile first.'; return; }
+  if (!anyLoaded()) { $('sp-status').textContent = 'Load a tile first.'; return; }
   if (EX.mode) { EX.cancel(); exploreOff(); }
   if (SAMPLER.samples.length >= 10) { $('sp-status').textContent = 'Maximum 10 classes.'; return; }
   const color = $('sp-color').value;
@@ -855,10 +1058,10 @@ function startSamplerDraw() {
     const name = $('sp-name').value.trim() || `Class ${SAMPLER.samples.length + 1}`;
     $('sp-status').textContent = `Reading "${name}"…`;
     try {
-      const { vectors } = await readBoxVectors(b, 48, 2048);
+      const { vectors, tile } = await readBoxVectors(b, 48, 2048);
       if (vectors.length < 5) { S.map.removeLayer(rect); $('sp-status').textContent = 'Too few valid pixels, draw a larger box.'; return; }
       rect.setStyle({ dashArray: null, fillOpacity: 0.25 });
-      SAMPLER.samples.push({ name, color, vectors, rect, tile: T.props.tile });
+      SAMPLER.samples.push({ name, color, vectors, rect, tile });
       $('sp-name').value = '';
       $('sp-color').value = SP_PALETTE[SAMPLER.samples.length % SP_PALETTE.length];
       renderSamples(); plotSamples();
@@ -926,11 +1129,15 @@ async function init() {
   ['px', 'ep', 'sp'].forEach(draggable);
   document.querySelectorAll('.legend input[data-st]').forEach(i => i.addEventListener('change', drawGrid));
   document.querySelectorAll('input[name=mode]').forEach(i => i.addEventListener('change', () => setMode(i.value)));
-  $('opacity').addEventListener('input', e => T.overlay && T.overlay.setOpacity(+e.target.value));
+  $('opacity').addEventListener('input', e => setOpacity(+e.target.value));
+  $('multi').addEventListener('change', e => setMulti(e.target.checked));
   $('q').addEventListener('keydown', e => { if (e.key === 'Enter') gotoTile(); });
   try { await loadGrid(); } catch (err) { status(`Could not load the grid: ${err.message}`); return; }
-  const m = location.hash.match(/tile=([0-9A-Z]{5})/i);
-  if (m && S.byTile[m[1].toUpperCase()]) selectTile(m[1].toUpperCase(), true);
+  // #tile=31UFS or #tile=31UFS,31UGS,... (several tiles turn on 'Select multiple')
+  const m = location.hash.match(/tile=([0-9A-Z,]+)/i);
+  const list = m ? m[1].toUpperCase().split(',').filter(x => S.byTile[x]).slice(0, CFG.MAX_TILES) : [];
+  if (list.length > 1) { V.multi = true; $('multi').checked = true; }
+  if (list.length) { list.forEach(x => selectTile(x)); fitSelection(); }
   else if (S.grid) S.map.fitBounds(S.grid.getBounds(), { padding: [20, 20] });
 }
 init();
