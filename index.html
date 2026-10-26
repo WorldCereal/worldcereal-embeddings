@@ -86,6 +86,7 @@
       <label><input type="checkbox" data-st="on_s3" checked/><span class="sw" style="border-color:var(--s3)"></span>On S3 (viewable &amp; downloadable)<span class="cnt" id="c-on_s3"></span></label>
       <label><input type="checkbox" data-st="local" checked/><span class="sw" style="border-color:var(--local)"></span>Processed, not on S3 yet<span class="cnt" id="c-local"></span></label>
       <label><input type="checkbox" data-st="todo" checked/><span class="sw" style="border-color:var(--todo)"></span>To be processed<span class="cnt" id="c-todo"></span></label>
+      <label style="margin-top:6px"><input type="checkbox" id="show-grid" checked/>Show grid cells</label>
       <div class="row" style="margin-top:8px">
         <input type="text" id="q" placeholder="Go to tile, e.g. 31UFS" style="flex:1"/>
         <button onclick="gotoTile()">Go</button>
@@ -96,7 +97,7 @@
     <div class="sec" id="tile-sec">
       <h2>Selected tile</h2>
       <label class="note" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer">
-        <input type="checkbox" id="multi"/> Select multiple tiles (compare neighbours / seams)</label>
+        <input type="checkbox" id="multi"/> Select multiple tiles</label>
       <div id="tile-list"></div>
       <div id="tile-info" class="note">Click a tile on the map.</div>
     </div>
@@ -117,7 +118,7 @@
         G <input type="number" id="b-g" min="1" max="128" value="64"/>
         B <input type="number" id="b-b" min="1" max="128" value="120"/>
         <button onclick="applyBands()">Apply</button>
-        <button onclick="randomBands()" title="Random spread-out bands">🎲</button>
+        <button onclick="randomBands()" title="Pick and apply random spread-out bands" style="font-size:14px;padding:5px 10px">🎲 Random spread-out bands</button>
       </div>
       <div class="row">
         Opacity <input type="range" id="opacity" min="0" max="1" step="0.05" value="1" style="flex:1"/>
@@ -323,6 +324,8 @@ async function loadGrid() {
 
 function drawGrid() {
   if (S.grid) S.map.removeLayer(S.grid);
+  S.grid = null;
+  if (!$('show-grid').checked) return;   // hidden so the images are fully visible
   const on = new Set([...document.querySelectorAll('.legend input[data-st]')].filter(i => i.checked).map(i => i.dataset.st));
   S.grid = L.geoJSON(S.gridData, {
     filter: f => on.has(f.properties.status) || !!tileByName(f.properties.tile),
@@ -1131,6 +1134,7 @@ async function init() {
   document.querySelectorAll('input[name=mode]').forEach(i => i.addEventListener('change', () => setMode(i.value)));
   $('opacity').addEventListener('input', e => setOpacity(+e.target.value));
   $('multi').addEventListener('change', e => setMulti(e.target.checked));
+  $('show-grid').addEventListener('change', drawGrid);
   $('q').addEventListener('keydown', e => { if (e.key === 'Enter') gotoTile(); });
   try { await loadGrid(); } catch (err) { status(`Could not load the grid: ${err.message}`); return; }
   // #tile=31UFS or #tile=31UFS,31UGS,... (several tiles turn on 'Select multiple')
