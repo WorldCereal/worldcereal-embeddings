@@ -11,7 +11,8 @@
 <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
 <style>
   :root { --bg:#12131c; --panel:#1a1c28; --line:#2a2d40; --txt:#d0d6e8; --dim:#7b84a0;
-          --acc:#c8922a; --s3:#2ecc71; --local:#f39c12; --todo:#e74c3c; }
+          --acc:#c8922a; --s3:#2ecc71; --local:#f39c12; --todo:#e74c3c;
+          --g-fin:#4dabf7; --g-prog:#da77f2; --g-fail:#adb5bd; }
   * { box-sizing:border-box; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--txt);
                font:13px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
@@ -43,7 +44,8 @@
   .warn { background:#3a2410; border:1px solid #8a5a1a; color:#f0c890; padding:8px; border-radius:4px;
           font-size:11px; margin:8px 0; }
   .warn code { color:#fff; }
-  #status { color:var(--acc); font-size:11px; min-height:16px; }
+  #status { color:var(--acc); font-size:12px; min-height:18px; position:sticky; top:-12px; z-index:5;
+            background:var(--panel); padding:4px 0; margin:-4px 0 4px; }
   .spin { display:inline-block; width:10px; height:10px; border:2px solid var(--acc); border-right-color:transparent;
           border-radius:50%; animation:sp 0.8s linear infinite; vertical-align:-1px; margin-right:5px; }
   @keyframes sp { to { transform:rotate(360deg); } }
@@ -78,8 +80,19 @@
   <div id="side">
     <h1>WorldCereal Embeddings</h1>
     <div class="sub">128-dim embeddings per S2 tile · uint8 quantized + per-pixel scale</div>
+    <div id="status"></div>
 
     <div id="cors-warn" class="warn" style="display:none"></div>
+
+    <div class="sec legend" id="global-sec">
+      <label><input type="checkbox" id="show-global"/>Show non-EU production progress</label>
+      <div id="global-legend" style="display:none;margin-left:22px">
+        <label><input type="checkbox" data-gst="finished" checked/><span class="sw" style="border-color:var(--g-fin)"></span>openEO finished<span class="cnt" id="g-finished"></span></label>
+        <label><input type="checkbox" data-gst="in_progress" checked/><span class="sw" style="border-color:var(--g-prog)"></span>openEO in progress<span class="cnt" id="g-in_progress"></span></label>
+        <label><input type="checkbox" data-gst="failed_cells" checked/><span class="sw" style="border-color:var(--g-fail)"></span>Has failed cells<span class="cnt" id="g-failed_cells"></span></label>
+        <div class="note">North America, Central America, Northern Eurasia and South Asia: produced by openEO, not yet mosaicked or viewable. <span id="global-date"></span></div>
+      </div>
+    </div>
 
     <div class="sec legend">
       <h2>S2 tiles</h2>
@@ -114,9 +127,9 @@
         <label><input type="radio" name="mode" value="scale"/> Scale</label>
       </div>
       <div class="row" id="band-row">
-        R <input type="number" id="b-r" min="1" max="128" value="8"/>
-        G <input type="number" id="b-g" min="1" max="128" value="64"/>
-        B <input type="number" id="b-b" min="1" max="128" value="120"/>
+        R <input type="number" id="b-r" min="1" max="128" value="53"/>
+        G <input type="number" id="b-g" min="1" max="128" value="67"/>
+        B <input type="number" id="b-b" min="1" max="128" value="75"/>
         <button onclick="applyBands()">Apply</button>
         <button onclick="randomBands()" title="Pick and apply random spread-out bands" style="font-size:14px;padding:5px 10px">🎲 Random spread-out bands</button>
       </div>
@@ -140,12 +153,11 @@
     </div>
 
     <div class="sec">
-      <div id="status"></div>
       <div class="note">
         Dequantization: <span class="mono">embedding = (float(q) − 128) · scale</span>,
         with <span class="mono">q</span> the uint8 value of the embeddings file and
         <span class="mono">scale</span> band 1 of the matching <span class="mono">_scale.tif</span>
-        (same grid). Nodata: 255 / NaN.
+        (same grid). Nodata: 255 in the embeddings, NaN in the scale.
       </div>
     </div>
   </div>
@@ -205,6 +217,8 @@ window.ZSTD_READY = zstd.init().then(() => {
 // ═══════════════════════════════════════════════════════════
 const CFG = {
   GRID_URL: 'data/s2_grid.geojson',
+  GLOBAL_URL: 'data/global_progress.geojson',   // optional non-EU progress layer, loaded on demand
+  GLOBAL_COLORS: { finished:'#4dabf7', in_progress:'#da77f2', failed_cells:'#adb5bd' },
   S3_BASE:  'https://s3.waw4-1.cloudferro.com/worldcereal-phase2-waw4-1-embeddings/worldcereal_embeddings',
   COLORS: { on_s3:'#2ecc71', local:'#f39c12', todo:'#e74c3c' },
   NODATA: 255,
@@ -222,6 +236,7 @@ const CFG = {
 // ═══════════════════════════════════════════════════════════
 const S = {
   map: null, grid: null, gridData: null, byTile: {},
+  global: null, globalData: null,
   cors: null,                     // true/false once probed
   pool: null,
 };
@@ -290,6 +305,7 @@ function initMap() {
   S.map = L.map('map', { zoomControl: true, preferCanvas: false }).setView([47, 3], 5);
   S.map.createPane('raster').style.zIndex = 350;   // below the grid outlines
   S.map.createPane('draw').style.zIndex = 650;
+  S.map.createPane('global').style.zIndex = 390;  // below the EU grid, which keeps the clicks where they overlap
   const base = {
     'Imagery': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: '© Esri', maxZoom: 19 }),
     'OSM':     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap', maxZoom: 19 }),
@@ -341,6 +357,59 @@ function drawGrid() {
         if (t) identify(e.latlng, t);   // inside a loaded tile: read the pixel
         else selectTile(p.tile);        // otherwise select (or, in multi mode, add) this tile
       });
+    },
+  }).addTo(S.map);
+}
+
+const REGION_NAMES = { 'north-america': 'North America', 'central-america': 'Central America',
+                       'northern-eurasia': 'Northern Eurasia', 'south-asia': 'South Asia' };
+
+async function toggleGlobal(on) {
+  $('global-legend').style.display = on ? '' : 'none';
+  if (!on) { if (S.global) S.map.removeLayer(S.global); S.global = null; return; }
+  if (!S.globalData) {
+    status('Loading non-EU production progress…', true);
+    try {
+      const res = await fetch(CFG.GLOBAL_URL, { cache: 'no-cache' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      S.globalData = await res.json();
+    } catch (err) {
+      status(`Could not load the non-EU progress: ${err.message}`);
+      $('show-global').checked = false; $('global-legend').style.display = 'none';
+      return;
+    }
+    const c = S.globalData.counts || {};
+    for (const k of Object.keys(CFG.GLOBAL_COLORS)) $('g-' + k).textContent = c[k] ?? 0;
+    $('global-date').textContent = S.globalData.generated ? `Status as of ${S.globalData.generated.replace('T', ' ').slice(0, 16)} UTC.` : '';
+    status('');
+  }
+  drawGlobal();
+  if (S.global && S.global.getLayers().length) {
+    const b = S.global.getBounds();
+    if (S.grid) b.extend(S.grid.getBounds());
+    S.map.fitBounds(b, { padding: [20, 20] });
+  }
+}
+
+function drawGlobal() {
+  if (S.global) S.map.removeLayer(S.global);
+  S.global = null;
+  if (!$('show-global').checked || !S.globalData) return;
+  const on = new Set([...document.querySelectorAll('#global-legend input[data-gst]')].filter(i => i.checked).map(i => i.dataset.gst));
+  S.global = L.geoJSON(S.globalData, {
+    pane: 'global',
+    filter: f => on.has(f.properties.status),
+    style: f => ({ color: CFG.GLOBAL_COLORS[f.properties.status], weight: 1, opacity: 0.85,
+                   fillColor: CFG.GLOBAL_COLORS[f.properties.status], fillOpacity: 0.05 }),
+    onEachFeature: (f, lyr) => {
+      const p = f.properties;
+      const st = { finished: 'openEO finished', in_progress: 'openEO in progress', failed_cells: 'has failed cells' }[p.status];
+      lyr.bindTooltip(`<b>${p.tile}</b> · ${esc(REGION_NAMES[p.region] || p.region)}<br>${p.start_date} → ${p.end_date}<br>`
+                      + `${st}: ${p.finished}/${p.n_cells} cells finished`
+                      + (p.failed ? `, ${p.failed} failed` : '') + (p.pending ? `, ${p.pending} pending` : '')
+                      + '<br><span class="note">not mosaicked yet: no downloads</span>',
+                      { sticky: true, className: 'tiletip' });
+      lyr.on('click', e => L.DomEvent.stopPropagation(e));   // progress only: nothing to select or load
     },
   }).addTo(S.map);
 }
@@ -1128,6 +1197,7 @@ function draggable(id) {
 // ═══════════════════════════════════════════════════════════
 async function init() {
   initMap();
+  ['b-r', 'b-g', 'b-b'].forEach((id, i) => $(id).value = V.bands[i]);
   S.pool = null;   // decode on the main thread, as in the UK viewer (float.html)
   ['px', 'ep', 'sp'].forEach(draggable);
   document.querySelectorAll('.legend input[data-st]').forEach(i => i.addEventListener('change', drawGrid));
@@ -1135,6 +1205,8 @@ async function init() {
   $('opacity').addEventListener('input', e => setOpacity(+e.target.value));
   $('multi').addEventListener('change', e => setMulti(e.target.checked));
   $('show-grid').addEventListener('change', drawGrid);
+  $('show-global').addEventListener('change', e => toggleGlobal(e.target.checked));
+  document.querySelectorAll('#global-legend input[data-gst]').forEach(i => i.addEventListener('change', drawGlobal));
   $('q').addEventListener('keydown', e => { if (e.key === 'Enter') gotoTile(); });
   try { await loadGrid(); } catch (err) { status(`Could not load the grid: ${err.message}`); return; }
   // #tile=31UFS or #tile=31UFS,31UGS,... (several tiles turn on 'Select multiple')
